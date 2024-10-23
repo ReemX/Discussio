@@ -64,7 +64,7 @@ builder.defineStreamHandler(
       const [_, imdbId, season, episode] = match;
       const showName = await getShowName(`tt${imdbId}`);
       const query = encodeURIComponent(
-        `${showName} Season ${season} Episode ${episode} discussion reviews`
+        `${showName} Season ${season} Episode ${episode} discussion`
       );
 
       return {
