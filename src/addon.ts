@@ -3,6 +3,7 @@ import {
   serveHTTP,
   Stream,
   StreamHandlerArgs,
+  publishToCentral,
 } from "npm:stremio-addon-sdk";
 
 // Cache for show names to improve performance
@@ -90,3 +91,5 @@ serveHTTP(builder.getInterface(), {
     ttl: 24 * 60 * 60, // Cache for 24 hours
   },
 });
+
+await publishToCentral("https://discussio.deno.dev");
