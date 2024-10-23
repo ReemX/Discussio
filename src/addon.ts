@@ -92,4 +92,4 @@ serveHTTP(builder.getInterface(), {
   },
 });
 
-await publishToCentral("https://discussio.deno.dev");
+await publishToCentral("https://discussio.deno.dev/manifest.json");
