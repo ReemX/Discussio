@@ -6,20 +6,55 @@ import {
   publishToCentral,
 } from "npm:stremio-addon-sdk";
 
+// Enum for log levels
+enum LogLevel {
+  DEBUG = 0,
+  INFO = 1,
+  WARN = 2,
+  ERROR = 3,
+}
+
+// Current log level - can be set via environment variable
+const CURRENT_LOG_LEVEL = Number(Deno.env.get("LOG_LEVEL") ?? LogLevel.INFO);
+
+// Logger utility
+const logger = {
+  debug: (message: string, data?: unknown) => {
+    if (CURRENT_LOG_LEVEL <= LogLevel.DEBUG) {
+      console.debug(`[DEBUG] ${message}`, data);
+    }
+  },
+  info: (message: string, data?: unknown) => {
+    if (CURRENT_LOG_LEVEL <= LogLevel.INFO) {
+      console.log(`[INFO] ${message}`, data);
+    }
+  },
+  warn: (message: string, data?: unknown) => {
+    if (CURRENT_LOG_LEVEL <= LogLevel.WARN) {
+      console.warn(`[WARN] ${message}`, data);
+    }
+  },
+  error: (message: string, data?: unknown) => {
+    if (CURRENT_LOG_LEVEL <= LogLevel.ERROR) {
+      console.error(`[ERROR] ${message}`, data);
+    }
+  },
+};
+
 // Global error handlers
 addEventListener("unhandledrejection", (event) => {
-  console.error("Unhandled Promise Rejection:", {
+  logger.error("Unhandled Promise Rejection:", {
     error: event.reason,
     timestamp: new Date().toISOString(),
-    stack: event.reason?.stack
+    stack: event.reason?.stack,
   });
 });
 
 addEventListener("error", (event) => {
-  console.error("Uncaught Error:", {
+  logger.error("Uncaught Error:", {
     error: event.error,
     timestamp: new Date().toISOString(),
-    stack: event.error?.stack
+    stack: event.error?.stack,
   });
 });
 
@@ -67,19 +102,17 @@ async function getShowName(imdbId: string): Promise<string> {
 
       showNameCache.set(imdbId, showName);
       return showName;
-
     } finally {
       clearTimeout(timeoutId);
     }
-
   } catch (error) {
-    if (error.name === 'AbortError') {
-      console.error(`Timeout fetching IMDB page for ${imdbId}`);
+    if (error.name === "AbortError") {
+      logger.warn(`Timeout fetching IMDB page for ${imdbId}`);
     } else {
-      console.error(`Error fetching IMDB page for ${imdbId}:`, {
+      logger.error(`Error fetching IMDB page for ${imdbId}:`, {
         error: error.message,
         stack: error.stack,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     }
     return imdbId;
@@ -89,14 +122,15 @@ async function getShowName(imdbId: string): Promise<string> {
 builder.defineStreamHandler(
   async (args: StreamHandlerArgs): Promise<{ streams: Stream[] }> => {
     try {
+      // Silently return empty streams for non-series content
       if (args.type !== "series") {
-        console.log("Non-series request rejected", { type: args.type });
+        logger.debug("Non-series request received", { type: args.type });
         return { streams: [] };
       }
 
       const match = args.id.match(/tt(\d+):(\d+):(\d+)/);
       if (!match) {
-        console.log("Invalid ID format rejected", { id: args.id });
+        logger.warn("Invalid ID format received", { id: args.id });
         return { streams: [] };
       }
 
@@ -104,13 +138,13 @@ builder.defineStreamHandler(
 
       // Add timeout for the entire handler
       const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error('Handler timeout')), 8000);
+        setTimeout(() => reject(new Error("Handler timeout")), 8000);
       });
 
       const handlerPromise = (async () => {
         const showName = await getShowName(`tt${imdbId}`);
         const query = encodeURIComponent(
-          `${showName} Season ${season} Episode ${episode} discussion`
+          `${showName} Season ${season} Episode ${episode} discussion`,
         );
 
         return {
@@ -126,45 +160,53 @@ builder.defineStreamHandler(
 
       // Race between timeout and handler
       return await Promise.race([handlerPromise, timeoutPromise]);
-
     } catch (error) {
-      console.error("Stream handler error:", {
+      logger.error("Stream handler error:", {
         error: error.message,
         stack: error.stack,
         timestamp: new Date().toISOString(),
-        args: JSON.stringify(args)
+        args: JSON.stringify(args),
       });
       return { streams: [] };
     }
-  }
+  },
 );
 
-// Wrap server startup in error handling
-try {
-  serveHTTP(builder.getInterface(), {
-    port: Deno.env.get("PORT") ? Number(Deno.env.get("PORT")) : 7000,
-    cache: {
-      max: 1000,
-      ttl: 24 * 60 * 60,
-    },
-  });
-  console.log("Server started successfully");
-} catch (error) {
-  console.error("Server startup error:", {
-    error: error.message,
-    stack: error.stack,
-    timestamp: new Date().toISOString()
-  });
+// Wrap server startup and publishing in error handling
+async function startServer(options: { shouldPublish?: boolean } = {}) {
+  try {
+    await serveHTTP(builder.getInterface(), {
+      port: Deno.env.get("PORT") ? Number(Deno.env.get("PORT")) : 7000,
+      cache: {
+        max: 1000,
+        ttl: 24 * 60 * 60,
+      },
+    });
+    logger.info("Server started successfully");
+
+    // Only publish during deployment when explicitly requested
+    if (options.shouldPublish) {
+      try {
+        await publishToCentral("https://discussio.deno.dev/manifest.json");
+        logger.info("Successfully published to Stremio Central!");
+      } catch (error) {
+        logger.error("Failed to publish to central:", {
+          error: error.message,
+          stack: error.stack,
+          timestamp: new Date().toISOString(),
+        });
+      }
+    }
+  } catch (error) {
+    logger.error("Server startup error:", {
+      error: error.message,
+      stack: error.stack,
+      timestamp: new Date().toISOString(),
+    });
+  }
 }
 
-// Publish to central with error handling
-try {
-  await publishToCentral("https://discussio.deno.dev/manifest.json");
-  console.log("Successfully published to Stremio Central!");
-} catch (error) {
-  console.error("Failed to publish to central:", {
-    error: error.message,
-    stack: error.stack,
-    timestamp: new Date().toISOString()
-  });
-}
+// Start server with publishing controlled by environment variable
+await startServer({
+  shouldPublish: Deno.env.get("PUBLISH_TO_CENTRAL") === "true",
+});
