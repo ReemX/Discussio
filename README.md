@@ -46,10 +46,30 @@ deno run --allow-net main.ts
 
 1. Install the addon
 2. Open any TV series in Stremio
-3. Navigate to the episode you want to discuss
-4. Click on the 'Streams' button
-5. Look for "Search Episode Discussions" in the streams list
-6. Click it to open Google search results for discussions about that episode
+3. Select a season and episode you want to discuss
+4. Look for the "Streams" button (usually shows a number of available streams)
+5. Click the "Streams" button to see available streaming options
+6. In the streams list, you'll find "Search Episode Discussions"
+7. Click it to open Google search results for discussions about that episode
+
+For example:
+- Open "Breaking Bad"
+- Go to Season 1, Episode 1
+- Click the "Streams" button
+- Find "Search Episode Discussions" in the list
+- Click to find discussions about Breaking Bad S01E01
+
+## 🔍 Can't Find the Addon?
+
+If you've installed the addon but can't find it:
+1. Make sure you're looking at a TV series (the addon doesn't work with movies)
+2. Go into a specific episode
+3. Click the "Streams" button (the same place where you'd find streaming sources)
+4. Scroll through the list of streams - "Search Episode Discussions" should be there
+5. If it's not showing up, try:
+   - Checking if the addon is properly installed in your addons list
+   - Restarting Stremio
+   - Try searching manually with the same show name and episode
 
 ## 🛠️ Technical Details
 
@@ -61,8 +81,6 @@ deno run --allow-net main.ts
 ## ⚙️ Configuration
 
 No configuration is needed! The addon works out of the box.
-
-- Try searching manually with the same show name and episode
 
 ## 🤝 Contributing
 
