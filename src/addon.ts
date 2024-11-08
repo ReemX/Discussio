@@ -17,6 +17,12 @@ enum LogLevel {
 // Current log level - can be set via environment variable
 const CURRENT_LOG_LEVEL = Number(Deno.env.get("LOG_LEVEL") ?? LogLevel.INFO);
 
+// Custom error interface
+interface ErrorWithStack {
+  message: string;
+  stack?: string;
+}
+
 // Logger utility
 const logger = {
   debug: (message: string, data?: unknown) => {
@@ -41,20 +47,35 @@ const logger = {
   },
 };
 
+// Helper function to extract error details
+function getErrorDetails(error: unknown): ErrorWithStack {
+  if (error instanceof Error) {
+    return {
+      message: error.message,
+      stack: error.stack,
+    };
+  }
+  return {
+    message: String(error),
+  };
+}
+
 // Global error handlers
 addEventListener("unhandledrejection", (event) => {
+  const errorDetails = getErrorDetails(event.reason);
   logger.error("Unhandled Promise Rejection:", {
-    error: event.reason,
+    error: errorDetails.message,
     timestamp: new Date().toISOString(),
-    stack: event.reason?.stack,
+    stack: errorDetails.stack,
   });
 });
 
 addEventListener("error", (event) => {
+  const errorDetails = getErrorDetails(event.error);
   logger.error("Uncaught Error:", {
-    error: event.error,
+    error: errorDetails.message,
     timestamp: new Date().toISOString(),
-    stack: event.error?.stack,
+    stack: errorDetails.stack,
   });
 });
 
@@ -65,8 +86,7 @@ const builder = new addonBuilder({
   id: "com.discussio",
   version: "1.0.0",
   name: "Discussio",
-  description:
-    "Opens Google search for TV show episode discussions with one click. Simply select an episode to search for its discussions online.",
+  description: `Opens Google search for TV show episode discussions with one click. Simply select an episode to search for its discussions online.`,
   resources: ["stream"],
   types: ["series"],
   idPrefixes: ["tt"],
@@ -105,13 +125,14 @@ async function getShowName(imdbId: string): Promise<string> {
     } finally {
       clearTimeout(timeoutId);
     }
-  } catch (error) {
-    if (error.name === "AbortError") {
+  } catch (error: unknown) {
+    const errorDetails = getErrorDetails(error);
+    if (error instanceof Error && error.name === "AbortError") {
       logger.warn(`Timeout fetching IMDB page for ${imdbId}`);
     } else {
       logger.error(`Error fetching IMDB page for ${imdbId}:`, {
-        error: error.message,
-        stack: error.stack,
+        error: errorDetails.message,
+        stack: errorDetails.stack,
         timestamp: new Date().toISOString(),
       });
     }
@@ -137,14 +158,14 @@ builder.defineStreamHandler(
       const [_, imdbId, season, episode] = match;
 
       // Add timeout for the entire handler
-      const timeoutPromise = new Promise((_, reject) => {
+      const timeoutPromise = new Promise<never>((_, reject) => {
         setTimeout(() => reject(new Error("Handler timeout")), 8000);
       });
 
       const handlerPromise = (async () => {
         const showName = await getShowName(`tt${imdbId}`);
         const query = encodeURIComponent(
-          `${showName} Season ${season} Episode ${episode} discussion`,
+          `${showName} Season ${season} Episode ${episode} discussion`
         );
 
         return {
@@ -160,16 +181,17 @@ builder.defineStreamHandler(
 
       // Race between timeout and handler
       return await Promise.race([handlerPromise, timeoutPromise]);
-    } catch (error) {
+    } catch (error: unknown) {
+      const errorDetails = getErrorDetails(error);
       logger.error("Stream handler error:", {
-        error: error.message,
-        stack: error.stack,
+        error: errorDetails.message,
+        stack: errorDetails.stack,
         timestamp: new Date().toISOString(),
         args: JSON.stringify(args),
       });
       return { streams: [] };
     }
-  },
+  }
 );
 
 // Wrap server startup and publishing in error handling
@@ -189,18 +211,20 @@ async function startServer(options: { shouldPublish?: boolean } = {}) {
       try {
         await publishToCentral("https://discussio.deno.dev/manifest.json");
         logger.info("Successfully published to Stremio Central!");
-      } catch (error) {
+      } catch (error: unknown) {
+        const errorDetails = getErrorDetails(error);
         logger.error("Failed to publish to central:", {
-          error: error.message,
-          stack: error.stack,
+          error: errorDetails.message,
+          stack: errorDetails.stack,
           timestamp: new Date().toISOString(),
         });
       }
     }
-  } catch (error) {
+  } catch (error: unknown) {
+    const errorDetails = getErrorDetails(error);
     logger.error("Server startup error:", {
-      error: error.message,
-      stack: error.stack,
+      error: errorDetails.message,
+      stack: errorDetails.stack,
       timestamp: new Date().toISOString(),
     });
   }
