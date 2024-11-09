@@ -79,108 +79,39 @@ addEventListener("error", (event) => {
   });
 });
 
-// Cache for show names to improve performance
-const showNameCache = new Map<string, string>();
-
 const builder = new addonBuilder({
   id: "com.discussio",
   version: "1.0.0",
-  name: "Discussio",
-  description: `Opens Google search for TV show episode discussions with one click. Simply select an episode to search for its discussions online.`,
+  name: "Discussio (Deprecated)",
+  description: `⚠️ This version is deprecated. Please update to the latest version of Discussio for continued functionality.`,
   resources: ["stream"],
   types: ["series"],
   idPrefixes: ["tt"],
   catalogs: [],
 });
 
-async function getShowName(imdbId: string): Promise<string> {
-  try {
-    // Check cache first
-    const cachedName = showNameCache.get(imdbId);
-    if (cachedName) return cachedName;
-
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000);
-
-    try {
-      const response = await fetch(`https://www.imdb.com/title/${imdbId}/`, {
-        signal: controller.signal,
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        },
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-
-      const html = await response.text();
-      const titleMatch = html.match(/<title>(.*?) - IMDb<\/title>/);
-      const showName =
-        titleMatch?.[1]?.replace(/\s*\([^)]*\)\s*$/, "").trim() ?? imdbId;
-
-      showNameCache.set(imdbId, showName);
-      return showName;
-    } finally {
-      clearTimeout(timeoutId);
-    }
-  } catch (error: unknown) {
-    const errorDetails = getErrorDetails(error);
-    if (error instanceof Error && error.name === "AbortError") {
-      logger.warn(`Timeout fetching IMDB page for ${imdbId}`);
-    } else {
-      logger.error(`Error fetching IMDB page for ${imdbId}:`, {
-        error: errorDetails.message,
-        stack: errorDetails.stack,
-        timestamp: new Date().toISOString(),
-      });
-    }
-    return imdbId;
-  }
-}
-
 builder.defineStreamHandler(
   async (args: StreamHandlerArgs): Promise<{ streams: Stream[] }> => {
     try {
-      // Silently return empty streams for non-series content
-      if (args.type !== "series") {
-        logger.debug("Non-series request received", { type: args.type });
-        return { streams: [] };
-      }
-
-      const match = args.id.match(/tt(\d+):(\d+):(\d+)/);
-      if (!match) {
-        logger.warn("Invalid ID format received", { id: args.id });
-        return { streams: [] };
-      }
-
-      const [_, imdbId, season, episode] = match;
-
-      // Add timeout for the entire handler
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        setTimeout(() => reject(new Error("Handler timeout")), 8000);
-      });
-
-      const handlerPromise = (async () => {
-        const showName = await getShowName(`tt${imdbId}`);
-        const query = encodeURIComponent(
-          `${showName} Season ${season} Episode ${episode} discussion`
-        );
-
+      // Return deprecation message for all valid requests
+      if (args.type === "series" && args.id.match(/tt(\d+):(\d+):(\d+)/)) {
         return {
           streams: [
             {
-              title: "Search Episode Discussions",
-              externalUrl: `https://www.google.com/search?q=${query}`,
+              title: "⚠️ Discussio has moved!",
+              externalUrl: "https://discussio.elfhosted.com", // Update this to your new server URL
               behavior: "Open",
             },
           ],
         };
-      })();
+      }
 
-      // Race between timeout and handler
-      return await Promise.race([handlerPromise, timeoutPromise]);
+      // Silently return empty streams for invalid requests
+      logger.debug("Invalid request received", {
+        type: args.type,
+        id: args.id,
+      });
+      return { streams: [] };
     } catch (error: unknown) {
       const errorDetails = getErrorDetails(error);
       logger.error("Stream handler error:", {
@@ -204,13 +135,15 @@ async function startServer(options: { shouldPublish?: boolean } = {}) {
         ttl: 24 * 60 * 60,
       },
     });
-    logger.info("Server started successfully");
+    logger.info("Deprecated server started successfully");
 
     // Only publish during deployment when explicitly requested
     if (options.shouldPublish) {
       try {
         await publishToCentral("https://discussio.deno.dev/manifest.json");
-        logger.info("Successfully published to Stremio Central!");
+        logger.info(
+          "Successfully published deprecated version to Stremio Central!"
+        );
       } catch (error: unknown) {
         const errorDetails = getErrorDetails(error);
         logger.error("Failed to publish to central:", {
