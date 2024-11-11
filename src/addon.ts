@@ -84,20 +84,23 @@ const showNameCache = new Map<string, string>();
 
 const builder = new addonBuilder({
   id: "com.discussio",
-  version: "1.0.1",
+  version: "1.0.2",
   name: "Discussio | ElfHosted",
-  description: `Opens Google search for TV show episode discussions with one click. Simply select an episode to search for its discussions online. \n\nHosted by ElfHosted!`,
+  description: `Opens Google search for TV show episodes and movie discussions with one click. Simply select an episode or movie to search for its discussions online. \n\nHosted by ElfHosted!`,
   resources: ["stream"],
-  types: ["series"],
+  types: ["series", "movie"],
   idPrefixes: ["tt"],
   catalogs: [],
 });
 
-async function getShowName(imdbId: string): Promise<string> {
+async function getIMDBDetails(imdbId: string): Promise<{
+  title: string;
+  year?: string;
+}> {
   try {
     // Check cache first
     const cachedName = showNameCache.get(imdbId);
-    if (cachedName) return cachedName;
+    if (cachedName) return { title: cachedName };
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 5000);
@@ -117,11 +120,14 @@ async function getShowName(imdbId: string): Promise<string> {
 
       const html = await response.text();
       const titleMatch = html.match(/<title>(.*?) - IMDb<\/title>/);
-      const showName =
-        titleMatch?.[1]?.replace(/\s*\([^)]*\)\s*$/, "").trim() ?? imdbId;
+      const yearMatch = html.match(/\((\d{4})\)/);
 
-      showNameCache.set(imdbId, showName);
-      return showName;
+      const title =
+        titleMatch?.[1]?.replace(/\s*\([^)]*\)\s*$/, "").trim() ?? imdbId;
+      const year = yearMatch?.[1];
+
+      showNameCache.set(imdbId, title);
+      return { title, year };
     } finally {
       clearTimeout(timeoutId);
     }
@@ -136,50 +142,96 @@ async function getShowName(imdbId: string): Promise<string> {
         timestamp: new Date().toISOString(),
       });
     }
-    return imdbId;
+    return { title: imdbId };
+  }
+}
+
+function buildSearchQuery(params: {
+  type: string;
+  title: string;
+  year?: string;
+  season?: string;
+  episode?: string;
+}): string {
+  const { type, title, year, season, episode } = params;
+
+  if (type === "series") {
+    return encodeURIComponent(
+      `${title} Season ${season} Episode ${episode} discussion`
+    );
+  } else {
+    const yearSuffix = year ? ` (${year})` : "";
+    return encodeURIComponent(
+      `${title}${yearSuffix} movie discussion reddit OR letterboxd OR "movie discussion" OR "film discussion"`
+    );
   }
 }
 
 builder.defineStreamHandler(
   async (args: StreamHandlerArgs): Promise<{ streams: Stream[] }> => {
     try {
-      // Silently return empty streams for non-series content
-      if (args.type !== "series") {
-        logger.debug("Non-series request received", { type: args.type });
-        return { streams: [] };
-      }
-
-      const match = args.id.match(/tt(\d+):(\d+):(\d+)/);
-      if (!match) {
-        logger.warn("Invalid ID format received", { id: args.id });
-        return { streams: [] };
-      }
-
-      const [_, imdbId, season, episode] = match;
-
-      // Add timeout for the entire handler
       const timeoutPromise = new Promise<never>((_, reject) => {
         setTimeout(() => reject(new Error("Handler timeout")), 8000);
       });
 
       const handlerPromise = (async () => {
-        const showName = await getShowName(`tt${imdbId}`);
-        const query = encodeURIComponent(
-          `${showName} Season ${season} Episode ${episode} discussion`
-        );
+        if (args.type === "series") {
+          const match = args.id.match(/tt(\d+):(\d+):(\d+)/);
+          if (!match) {
+            logger.warn("Invalid series ID format received", { id: args.id });
+            return { streams: [] };
+          }
 
-        return {
-          streams: [
-            {
-              title: "Search Episode Discussions",
-              externalUrl: `https://www.google.com/search?q=${query}`,
-              behavior: "Open",
-            },
-          ],
-        };
+          const [_, imdbId, season, episode] = match;
+          const { title } = await getIMDBDetails(`tt${imdbId}`);
+
+          const query = buildSearchQuery({
+            type: "series",
+            title,
+            season,
+            episode,
+          });
+
+          return {
+            streams: [
+              {
+                title: "Search Episode Discussions",
+                externalUrl: `https://www.google.com/search?q=${query}`,
+                behavior: "Open",
+              },
+            ],
+          };
+        } else if (args.type === "movie") {
+          const match = args.id.match(/tt(\d+)/);
+          if (!match) {
+            logger.warn("Invalid movie ID format received", { id: args.id });
+            return { streams: [] };
+          }
+
+          const [_, imdbId] = match;
+          const { title, year } = await getIMDBDetails(`tt${imdbId}`);
+
+          const query = buildSearchQuery({
+            type: "movie",
+            title,
+            year,
+          });
+
+          return {
+            streams: [
+              {
+                title: "Search Movie Discussions",
+                externalUrl: `https://www.google.com/search?q=${query}`,
+                behavior: "Open",
+              },
+            ],
+          };
+        }
+
+        logger.debug("Unsupported content type received", { type: args.type });
+        return { streams: [] };
       })();
 
-      // Race between timeout and handler
       return await Promise.race([handlerPromise, timeoutPromise]);
     } catch (error: unknown) {
       const errorDetails = getErrorDetails(error);
