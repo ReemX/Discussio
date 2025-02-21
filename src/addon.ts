@@ -84,9 +84,10 @@ const showNameCache = new Map<string, string>();
 
 const builder = new addonBuilder({
   id: "com.discussio",
-  version: "1.0.2",
+  version: "1.0.3",
   name: "Discussio | ElfHosted",
   description: `Opens Google search for TV show episodes and movie discussions with one click. Simply select an episode or movie to search for its discussions online. \n\nHosted by ElfHosted!`,
+  logo: "https://api.logo.com/api/v2/images?design=lg_aiGdQc9PParm0yrELH&width=250&height=250&fit=contain&margin_ratio=0&background=%23294fff&u=2025-02-19T10%3A24%3A54.398Z&format=png&quality=30",
   resources: ["stream"],
   types: ["series", "movie"],
   idPrefixes: ["tt"],
