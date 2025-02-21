@@ -3,7 +3,7 @@
 A simple yet powerful Stremio addon that helps you find discussions with one click. Whether you're watching a TV show episode or a movie, simply click the addon to open a Google search for relevant discussions.
 
 ![Stremio Badge](https://img.shields.io/badge/Stremio-Addon-red.svg)
-![Version](https://img.shields.io/badge/version-1.0.2-blue.svg)
+![Version](https://img.shields.io/badge/version-1.0.3-blue.svg)
 
 ## 🚀 Features
 
