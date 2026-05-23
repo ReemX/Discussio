@@ -3,100 +3,102 @@
 A simple yet powerful Stremio addon that helps you find discussions with one click. Whether you're watching a TV show episode or a movie, simply click the addon to open a Google search for relevant discussions.
 
 ![Stremio Badge](https://img.shields.io/badge/Stremio-Addon-red.svg)
-![Version](https://img.shields.io/badge/version-1.0.3-blue.svg)
+![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)
 
 ## 🚀 Features
 
 - One-click access to discussions for both TV shows and movies
 - Works with any TV series or movie on Stremio
-- Automatically fetches correct titles and years from IMDB
+- Metadata sourced from **Cinemeta** (Stremio's official metadata addon) — no more broken titles
+- Episode titles included in series searches for sharper results
 - Specialized search queries for optimal results
-- Fast and lightweight
+- Public anonymous stats page (`/stats`) — no PII, just request counts
+- Fast and lightweight, in-process LRU cache + persistent Deno KV counters
 - No configuration needed
 
 ## 📦 Installation
 
-### Method 1: Install from Stremio Addon Repository
+### Hosted instance (recommended)
 
-1. Open Stremio
-2. Click the puzzle piece icon (addons)
-3. Click 'Community Addons'
-4. Search for "Discussio"
-5. Click 'Install'
+Add this URL inside Stremio → Addons → "Add addon":
 
-### Method 2: Local Development Setup
+```
+https://discussio.elfhosted.com/manifest.json
+```
+
+Hosted free of charge by [ElfHosted](https://elfhosted.com).
+
+### Local development
 
 ```bash
-# Clone the repository
 git clone https://github.com/yourusername/discussio.git
-# Navigate to the directory
 cd discussio
-# Install dependencies
-deno install
-# Run the addon
-deno run --allow-net main.ts
-# Once running, add to Stremio:
-# 1. Open Stremio
-# 2. Go to the addons section
-# 3. Add addon URL: http://127.0.0.1:11470/manifest.json
+deno task dev
+# Then in Stremio, add: http://127.0.0.1:7000/manifest.json
 ```
 
 ## 🎯 How to Use
 
-### For TV Shows:
+### For TV Shows
 
 1. Open any TV series in Stremio
 2. Select a season and episode you want to discuss
-3. Look for the "Streams" button (usually shows a number of available streams)
-4. Click the "Streams" button to see available streaming options
-5. In the streams list, you'll find "Search Episode Discussions"
-6. Click it to open Google search results for discussions about that episode
+3. Click the "Streams" button
+4. Find "Search Episode Discussions" in the list
+5. Click to open Google search results for that episode
 
-For example:
-
-- Open "Breaking Bad"
-- Go to Season 1, Episode 1
-- Click the "Streams" button
-- Find "Search Episode Discussions" in the list
-- Click to find discussions about Breaking Bad S01E01
-
-### For Movies:
+### For Movies
 
 1. Open any movie in Stremio
 2. Click the "Streams" button
-3. Find "Search Movie Discussions" in the list
-4. Click to find discussions about the movie
+3. Click "Search Movie Discussions"
 
 The search will automatically include:
-
 - The movie's release year (when available)
-- Results from popular discussion platforms like Reddit and Letterboxd
-- Relevant movie discussion forums
+- Results from Reddit, Letterboxd, and general film discussion forums
 
-## 🔍 Can't Find the Addon?
+## 📊 Stats
 
-If you've installed the addon but can't find it:
+Anonymous usage counters are exposed at:
+- `https://discussio.elfhosted.com/stats` — human-readable page
+- `https://discussio.elfhosted.com/stats.json` — machine-readable JSON
 
-1. Make sure you're looking at either a TV series episode or a movie
-2. For TV shows, make sure you're in a specific episode
-3. Click the "Streams" button (the same place where you'd find streaming sources)
-4. Scroll through the list of streams - "Search Episode Discussions" or "Search Movie Discussions" should be there
-5. If it's not showing up, try:
-   - Checking if the addon is properly installed in your addons list
-   - Restarting Stremio
-   - Try searching manually with the same title
+Tracked: total request count, type breakdown (series vs movie), per-day counts (last 30 days), top requested IMDB IDs (top 25). No IPs, no user agents, no identifiers.
 
 ## 🛠️ Technical Details
 
 - Built with Deno and TypeScript
-- Uses Stremio Addon SDK
-- Implements caching for better performance
-- Runs on port 11470 by default
-- Intelligent search query construction for different content types
+- Uses **Cinemeta** (`https://v3-cinemeta.strem.io`) for title/episode metadata
+- Native `Deno.serve` HTTP server (no SDK runtime dependency)
+- LRU + TTL in-memory cache (5000 entries × 24h)
+- Persistent counters via Deno KV (falls back to memory if unavailable)
+- Default port: `7000` (override with `PORT` env var)
+- Log level via `LOG_LEVEL` env var (`0`=debug, `1`=info, `2`=warn, `3`=error)
+
+### Endpoints
+
+| Path | Description |
+|------|-------------|
+| `/` | Landing page |
+| `/manifest.json` | Stremio addon manifest |
+| `/stream/series/:id.json` | Stream handler for series episodes |
+| `/stream/movie/:id.json` | Stream handler for movies |
+| `/stats` | Public stats page |
+| `/stats.json` | Public stats JSON |
+| `/healthz` | Health check |
+
+## 🔧 What Changed in 1.1.0
+
+- **Fixed**: Titles showing as raw IMDB IDs (e.g. `tt31889371`) — IMDB changed their HTML, breaking the old scraper. Replaced with Cinemeta.
+- **Fixed**: Discussio entry sometimes missing entirely — addon now always emits a stream, falling back to an IMDB-ID-based search when metadata lookup fails (rare/new titles, Cinemeta hiccups).
+- **Added**: Episode titles in series search queries.
+- **Added**: `/stats` and `/stats.json` endpoints.
+- **Added**: Bounded LRU cache + negative cache (avoids retry storms on bad IDs).
+- **Changed**: Native `Deno.serve` router replaces SDK runtime — fewer deps, more control.
 
 ## ⚙️ Configuration
 
-No configuration is needed! The addon works out of the box.
+No configuration is needed.
 
 ## 🤝 Contributing
 
