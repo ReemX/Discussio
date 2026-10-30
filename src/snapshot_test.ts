@@ -30,6 +30,24 @@ Deno.test("mergeSnapshot treats a dropped title count as evicted and re-counted"
   assertEquals(s.totals.titles.tt1, 6);
 });
 
+Deno.test("mergeSnapshot handles replicas read in alternation", () => {
+  let s = emptySnapshot();
+  s = mergeSnapshot(s, raw("a", 10, { tt1: 4 }));
+  s = mergeSnapshot(s, raw("b", 7, { tt1: 2 }));
+  s = mergeSnapshot(s, raw("a", 12, { tt1: 5 }));
+  s = mergeSnapshot(s, raw("b", 7, { tt1: 2 }));
+  assertEquals(s.totals.counters.views, 19);
+  assertEquals(s.totals.titles.tt1, 7);
+  assertEquals(baselineFor(s, "a").counters.views, 7);
+});
+
+Deno.test("mergeSnapshot forgets instances unseen for two days", () => {
+  let s = mergeSnapshot(emptySnapshot(), raw("a", 10, {}), new Date("2026-01-01T00:00:00Z"));
+  s = mergeSnapshot(s, raw("b", 1, {}), new Date("2026-01-04T00:00:00Z"));
+  assertEquals(Object.keys(s.instances!), ["b"]);
+  assertEquals(s.totals.counters.views, 11);
+});
+
 Deno.test("baselineFor removes this instance's already-merged counts", () => {
   let s = mergeSnapshot(emptySnapshot(), raw("a", 10, { tt1: 4 }));
   s = mergeSnapshot(s, raw("b", 3, { tt1: 1 }));

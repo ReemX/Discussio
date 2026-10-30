@@ -109,6 +109,12 @@ Stats are kept in memory and persisted one of two ways:
 | **Upstash Redis** | `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN` are set | Counts are flushed once a minute as a single `EVAL` (~45K commands / ~0.5 GB a month, well inside the free tier). Upstash is the only source of truth. |
 | **GitHub snapshot** | default, needs no secrets | The [Stats snapshot](.github/workflows/stats-snapshot.yml) Action reads `/stats/raw.json` every 15 minutes and merges it into `stats.json` on the `stats-data` branch using only the built-in `GITHUB_TOKEN`. The server reads that public file back for all-time totals. At most ~15 minutes of counts are lost per restart. |
 
+The host runs several replicas behind a load balancer, each counting on its
+own. Both backends sum them: Upstash receives every replica's increments, and
+the snapshot Action reads `/stats/raw.json` repeatedly over fresh connections to
+reach every replica, keeping each instance's last reading so it only ever adds
+what's new.
+
 The `stats-data` branch is force-pushed as a single commit, so it never grows,
 and it's separate from `main`, so snapshots never trigger a deploy. Set
 `STATS_SNAPSHOT_URL` to read the snapshot from elsewhere (e.g. a fork).
