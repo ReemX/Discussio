@@ -3,26 +3,27 @@
 A Stremio addon that takes you to the discussion for whatever you're watching in one click. Pick an episode or a movie, and Discussio sends you straight to where people are actually talking about it — the right venue for the kind of content, not a generic web search.
 
 ![Stremio Badge](https://img.shields.io/badge/Stremio-Addon-red.svg)
-![Version](https://img.shields.io/badge/version-1.2.0-blue.svg)
+![Version](https://img.shields.io/badge/version-1.3.0-blue.svg)
 
 ## 🚀 Features
 
 - One-click discussions for anime, TV series, and movies
 - **Venue-aware routing** — each content type points at where its discussion really lives:
-  - **Anime** → the [r/anime](https://reddit.com/r/anime) episode/film discussion thread (the largest anime community)
-  - **TV series** → the show's own subreddit episode-discussion thread (found via Google across Reddit)
-  - **Movies** → the film's [Letterboxd](https://letterboxd.com) page — straight to thousands of persistent reviews & comments, no search hop
-- **First-class anime support** — works with both Kitsu ids (`kitsu:`) and anime that Stremio serves under IMDB ids, which are auto-detected and routed to r/anime
-- Titles resolved from **Cinemeta** (live-action / IMDB) and the **Kitsu** addon (anime) — English titles preferred for sharper anime results
+  - **Anime** → the exact [r/anime](https://reddit.com/r/anime) episode discussion thread
+  - **TV series** → the show's own subreddit episode-discussion thread
+  - **Movies** → the film's [Letterboxd](https://letterboxd.com) page, plus the r/movies official discussion
+- **Precise anime matching** — queries quote r/anime's thread title format (`Season 2 - Episode 3 discussion`), and long-running shows split into seasons (One Piece) also match by absolute episode number
+- **Every anime id** — Kitsu, MyAnimeList, AniList and AniDB ids, plus anime served under IMDB ids (auto-detected)
+- **TMDB movies** deep-link straight to Letterboxd
+- Install page with one-click install (`stremio://`), Stremio Web install and copy-URL
 - Public anonymous stats page (`/stats`) — no PII, just request counts
-- Fast and lightweight: in-process LRU + negative cache, optional persistent Deno KV counters
 - No configuration needed
 
 ## 📦 Installation
 
 ### Hosted instance (recommended)
 
-Add this URL inside Stremio → Addons → "Add addon":
+Open **https://discussio.elfhosted.com** and click **Install in Stremio**, or add this URL inside Stremio → Addons → "Add addon":
 
 ```
 https://discussio.elfhosted.com/manifest.json
@@ -33,8 +34,8 @@ Hosted free of charge by [ElfHosted](https://elfhosted.com).
 ### Local development
 
 ```bash
-git clone https://github.com/yourusername/discussio.git
-cd discussio
+git clone https://github.com/ReemX/Discussio.git
+cd Discussio
 deno task dev
 # Then in Stremio (desktop app), add: http://127.0.0.1:7000/manifest.json
 ```
@@ -42,47 +43,46 @@ deno task dev
 > Use the Stremio **desktop** app for local testing — the web app is served over
 > HTTPS and blocks `http://localhost` addons (mixed content).
 
+| Task | What it does |
+|---|---|
+| `deno task dev` | Run with file watching |
+| `deno task start` | Run for production |
+| `deno task test` | Unit tests for id parsing and routing |
+| `deno task check` | Type-check, lint and test (what CI runs) |
+
 ## 🎯 How to Use
 
-### Anime
+Open any episode or movie, open the **Streams** list, and pick a **Discussio** entry:
 
-1. Open any anime in Stremio and pick an episode (or open an anime film)
-2. Open the **Streams** list
-3. Click **Search Episode Discussions** → lands on the r/anime discussion thread
-
-Works whether the anime is provided under a Kitsu id or an IMDB id — Discussio
-detects anime either way.
-
-### TV Shows
-
-1. Open a series, select a season and episode
-2. Open the **Streams** list → **Search Episode Discussions**
-3. Opens a Reddit search tuned to the show's own episode-discussion thread
-   (uses season/episode plus the episode title, which is how those threads are titled)
-
-### Movies
-
-1. Open a movie → open the **Streams** list
-2. Click **Movie Discussion · Letterboxd**
-3. Teleports directly to the film's Letterboxd page (reviews + comments)
+| Content | Streams |
+|---|---|
+| Anime episode | 💬 r/anime · Episode discussion |
+| TV episode | 💬 Reddit · Episode discussion |
+| Movie | 🎬 Letterboxd · Reviews & discussion, 💬 r/movies · Official discussion |
+| Anime film | 💬 r/anime · Movie discussion, 🎬 Letterboxd · Reviews & discussion |
 
 ## 🧠 How routing works
 
 | Content | Destination | Method |
 |---|---|---|
-| Anime episode / film | r/anime thread | Google scoped to `site:reddit.com/r/anime` |
-| TV series episode | show's subreddit thread | Google scoped to `site:reddit.com` |
-| Movie | Letterboxd film page | direct deep-link, no search |
+| Anime episode / film | r/anime thread | Google, quoted thread-title phrase, scoped to `site:reddit.com/r/anime` |
+| TV series episode | show's subreddit thread | Google with season/episode + episode title, scoped to `site:reddit.com` |
+| Movie | Letterboxd film page | direct deep-link by IMDB or TMDB id |
+| Movie | r/movies official discussion | Google scoped to `site:reddit.com/r/movies` |
+
+**Why Google search pages, not a direct jump?** Google's "I'm Feeling Lucky"
+(`btnI`) now stops on a *Redirect Notice* page — the same one click as the
+results page, but without a fallback when the top hit is wrong. Reddit's own
+search ranks discussion threads far worse, and Reddit blocks keyless server-side
+lookups, so a precise Google query is the most reliable path.
 
 **Anime detection:** ids prefixed `kitsu:` / `mal:` / `anilist:` / `anidb:` are
 anime by definition. IMDB-id content is treated as anime when its Cinemeta
-metadata is animation *and* originates from Japan — so Japanese anime served
-under `tt` ids reaches r/anime, while Western animation does not.
+metadata is animation *and* the country includes Japan.
 
-**Movies → Letterboxd:** for catalog films, Letterboxd holds far more persistent
-engagement than a long-archived Reddit megathread, and it is deep-linkable by
-both IMDB id (`/imdb/{tt}/`) and TMDB id (`/tmdb/{id}/`) — keyless and
-first-party — so movies need no title lookup at all and TMDB ids resolve for free.
+**Anime titles:** Kitsu's English alias is preferred over the romaji name, and
+per-season Kitsu entries ("Sousou no Frieren 2nd Season") are mapped to
+r/anime's `Season 2 - Episode N` phrasing.
 
 ## 📊 Stats
 
@@ -92,30 +92,29 @@ Anonymous usage counters are exposed at:
 
 Tracked: total request count, type breakdown (series vs movie), per-day counts
 (last 30 days), and top requested title ids (top 25). No IPs, no user agents,
-no identifiers.
+no identifiers. Stats are cached for 60 seconds.
 
 ## 🛠️ Technical Details
 
-- Built with Deno and TypeScript
-- **Metadata registry** maps each id scheme to its meta source, all keyless:
+- Built with Deno and TypeScript, native `Deno.serve` (no SDK runtime dependency)
+- `src/discussio.ts` — pure routing logic (id parsing, title picking, queries, streams), unit-tested in `src/discussio_test.ts`
+- `src/addon.ts` — HTTP server, metadata cache, stats, HTML pages
+- **Metadata sources**, all keyless:
   - `tt` → **Cinemeta** (`https://v3-cinemeta.strem.io`)
-  - `kitsu` → **Kitsu** addon (`https://anime-kitsu.strem.fun`)
+  - `kitsu` / `mal` / `anilist` / `anidb` → **Kitsu** addon (`https://anime-kitsu.strem.fun`)
   - `tmdb` movies → **Letterboxd** id deep-link (no meta fetch needed)
-- Native `Deno.serve` HTTP server (no SDK runtime dependency)
-- LRU + TTL in-memory cache (5000 entries × 24h) + short negative cache
-- Persistent counters via Deno KV when available (run with `--unstable-kv`),
-  falls back to in-memory
-- The manifest is served `no-cache` so capability changes (types / `idPrefixes`)
-  are never hidden behind a stale cached copy in Stremio
-- `idPrefixes`: `tt`, `kitsu:`
-- Default port: `7000` (override with `PORT` env var)
-- Log level via `LOG_LEVEL` env var (`0`=debug, `1`=info, `2`=warn, `3`=error)
+- Compact LRU + TTL cache (5000 titles × 24h; only the fields routing needs are kept) + short negative cache + in-flight request de-duplication
+- Responses are cached 24h; fallback responses (metadata unavailable) only 5 minutes
+- Persistent counters via Deno KV (`--unstable-kv`), falls back to in-memory
+- The manifest claims no `idPrefixes`, so Stremio offers every series/movie id and unroutable ids get an empty answer. Stremio never refreshes an installed manifest, so this lets new id schemes reach existing installs without a reinstall
+- The manifest is served `no-cache` so a fresh install always gets the current copy
+- Default port: `7000` (override with `PORT`), log level via `LOG_LEVEL` (`0`=debug … `3`=error)
 
 ### Endpoints
 
 | Path | Description |
 |------|-------------|
-| `/` | Landing page |
+| `/` | Install page |
 | `/manifest.json` | Stremio addon manifest |
 | `/stream/series/:id.json` | Stream handler for series / anime episodes |
 | `/stream/movie/:id.json` | Stream handler for movies / anime films |
@@ -123,31 +122,22 @@ no identifiers.
 | `/stats.json` | Public stats JSON |
 | `/healthz` | Health check |
 
-## 🔧 What Changed in 1.2.0
+## 🔧 What Changed in 1.3.0
 
-- **Added**: anime support. Anime never reached the addon before because the
-  manifest only claimed IMDB (`tt`) ids; it now also claims `kitsu:` ids and
-  resolves anime titles via the Kitsu addon.
-- **Added**: anime auto-detection for anime served under IMDB ids (Japanese
-  animation), routing it to r/anime instead of treating it as a Western series.
-- **Changed**: discussion routing is now venue-aware — anime → r/anime, TV →
-  the show's subreddit, movies → Letterboxd — replacing the single generic
-  Google search.
-- **Changed**: movies teleport straight to their Letterboxd film page (IMDB or
-  TMDB id), with no title lookup; TMDB ids resolve for free.
-- **Changed**: series queries use natural-language numbering plus the episode
-  title to better match how subreddit threads are titled.
-- **Fixed**: the manifest is now served `no-cache`. A previous 24h cache header
-  caused Stremio to keep an addon's old capabilities, silently dropping newly
-  supported content (this is what hid anime support).
-
-## ⚙️ Configuration
-
-No configuration is needed.
+- **Added**: install page with one-click Stremio install, Stremio Web install and copy-URL.
+- **Added**: MyAnimeList, AniList and AniDB ids (via the Kitsu addon), and TMDB movie ids (→ Letterboxd).
+- **Changed**: the manifest no longer restricts `idPrefixes`, so future id support is server-side only. **Existing users: install once more** to pick this up (Stremio keeps the manifest from install time) — it's the last reinstall needed.
+- **Added**: movies get a second link to the r/movies official discussion; anime films also link to Letterboxd.
+- **Improved**: anime queries quote r/anime's exact thread-title phrase, map Kitsu season entries to `Season N`, and fall back to absolute numbering for long-runners — e.g. One Piece no longer lands on another show's thread.
+- **Fixed**: Kitsu titles picked the romaji name when the canonical name was already English.
+- **Fixed**: whole metadata responses (up to ~1.4 MB each) were cached, risking gigabytes of memory; only routing fields are kept now.
+- **Fixed**: fallback responses were cached for 24h, pinning poor links after a metadata hiccup.
+- **Fixed**: stats links for non-IMDB ids, malformed ids returning 500, and `/stats` scanning all of KV on every view.
+- Stream entries now use Stremio's `description` field with a venue + title line.
 
 ## 🤝 Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome! Run `deno task check` before opening a Pull Request.
 
 ## 💌 Contact
 

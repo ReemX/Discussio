@@ -1,25 +1,35 @@
-// Discussio — Stremio addon for one-click discussion search.
-// Uses Cinemeta (Stremio's official metadata addon) instead of scraping IMDB.
+// Discussio — Stremio addon for one-click discussion links.
+// Routing lives in discussio.ts; this file is the HTTP server, metadata cache
+// and anonymous stats.
 
-const VERSION = "1.2.0";
-const MANIFEST_URL = "https://discussio.elfhosted.com/manifest.json";
-const CINEMETA_BASE = "https://v3-cinemeta.strem.io/meta";
-const KITSU_BASE = "https://anime-kitsu.strem.fun/meta";
+import {
+  type ContentType,
+  META_SOURCES,
+  movieStreams,
+  parseId,
+  type RawMeta,
+  seriesStreams,
+  type Stream,
+  type TitleInfo,
+  toTitleInfo,
+} from "./discussio.ts";
 
-// Maps a content-id scheme to the Stremio meta addon that resolves it.
-// All sources speak the same /meta/{type}/{id}.json shape and need no API key.
-// Schemes absent here (e.g. "tmdb") fall back to an id-based search query.
-const META_SOURCES: Record<string, string> = {
-  tt: CINEMETA_BASE,
-  kitsu: KITSU_BASE,
-};
+const VERSION = "1.3.0";
+const REPO_URL = "https://github.com/ReemX/Discussio";
+const LOGO_URL =
+  "https://api.logo.com/api/v2/images?design=lg_aiGdQc9PParm0yrELH&width=250&height=250&fit=contain&margin_ratio=0&background=%23294fff&u=2025-02-19T10%3A24%3A54.398Z&format=png&quality=30";
 const TITLE_CACHE_MAX = 5000;
 const TITLE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const NEGATIVE_CACHE_TTL_MS = 5 * 60 * 1000;
 const NEGATIVE_CACHE_MAX = 1000;
 const TOP_IDS_MEM_MAX = 2000;
-const CINEMETA_TIMEOUT_MS = 5000;
+const META_TIMEOUT_MS = 5000;
 const HANDLER_TIMEOUT_MS = 6500;
+const STATS_CACHE_MS = 60 * 1000;
+// Full answers are stable for a day; degraded ones (metadata unavailable)
+// are retried soon instead of pinning a poor link in Stremio's cache.
+const CACHE_OK = "max-age=86400, stale-while-revalidate=86400, stale-if-error=604800";
+const CACHE_DEGRADED = "max-age=300";
 const STARTED_AT = new Date().toISOString();
 
 enum LogLevel {
@@ -60,11 +70,14 @@ const MANIFEST = {
   version: VERSION,
   name: "Discussio | ElfHosted",
   description:
-    "Opens Google search for TV show episodes and movie discussions with one click. Simply select an episode or movie to search for its discussions online.\n\nHosted by ElfHosted!",
-  logo: "https://api.logo.com/api/v2/images?design=lg_aiGdQc9PParm0yrELH&width=250&height=250&fit=contain&margin_ratio=0&background=%23294fff&u=2025-02-19T10%3A24%3A54.398Z&format=png&quality=30",
+    "One click from any episode or movie to where people are discussing it: r/anime episode threads for anime, the show's subreddit thread for TV, and Letterboxd plus r/movies for films.\n\nHosted by ElfHosted!",
+  logo: LOGO_URL,
   resources: ["stream"],
   types: ["series", "movie"],
-  idPrefixes: ["tt", "kitsu:"],
+  // No idPrefixes on purpose: Stremio then offers every series/movie id, and
+  // ids we can't route get an empty answer. Stremio never refreshes an
+  // installed manifest, so claiming everything up front means new id schemes
+  // supported server-side reach existing installs without a reinstall.
   catalogs: [],
   behaviorHints: {
     configurable: false,
@@ -72,34 +85,16 @@ const MANIFEST = {
   },
 } as const;
 
-interface CinemetaVideo {
-  season?: number;
-  episode?: number;
-  number?: number;
-  name?: string;
-  title?: string;
-  id?: string;
-}
-
-interface CinemetaMeta {
-  id: string;
-  name: string;
-  aliases?: string[];
-  genres?: string[];
-  country?: string;
-  year?: string;
-  releaseInfo?: string;
-  videos?: CinemetaVideo[];
-}
+// ===== Metadata cache =====
 
 interface CacheEntry {
-  meta: CinemetaMeta;
+  info: TitleInfo;
   ts: number;
 }
 
 const metaCache = new Map<string, CacheEntry>();
 
-function cacheGet(key: string): CinemetaMeta | undefined {
+function cacheGet(key: string): TitleInfo | undefined {
   const entry = metaCache.get(key);
   if (!entry) return undefined;
   if (Date.now() - entry.ts > TITLE_CACHE_TTL_MS) {
@@ -108,15 +103,15 @@ function cacheGet(key: string): CinemetaMeta | undefined {
   }
   metaCache.delete(key);
   metaCache.set(key, entry);
-  return entry.meta;
+  return entry.info;
 }
 
-function cacheSet(key: string, meta: CinemetaMeta): void {
+function cacheSet(key: string, info: TitleInfo): void {
   if (metaCache.size >= TITLE_CACHE_MAX) {
     const oldest = metaCache.keys().next().value;
     if (oldest !== undefined) metaCache.delete(oldest);
   }
-  metaCache.set(key, { meta, ts: Date.now() });
+  metaCache.set(key, { info, ts: Date.now() });
 }
 
 const failureCache = new Map<string, number>();
@@ -139,27 +134,38 @@ function markFailure(key: string): void {
   failureCache.set(key, Date.now());
 }
 
-async function fetchMeta(
+// Concurrent requests for the same title share one upstream fetch.
+const inFlight = new Map<string, Promise<TitleInfo | null>>();
+
+function fetchMeta(
   scheme: string,
-  type: "series" | "movie",
+  type: ContentType,
   metaId: string,
-): Promise<CinemetaMeta | null> {
+): Promise<TitleInfo | null> {
   const baseUrl = META_SOURCES[scheme];
-  if (!baseUrl) {
-    logger.info(`No meta source for scheme "${scheme}" (${metaId})`);
-    return null;
-  }
+  if (!baseUrl) return Promise.resolve(null);
   const cacheKey = `${type}:${metaId}`;
   const cached = cacheGet(cacheKey);
-  if (cached) return cached;
-  if (isNegativeCached(cacheKey)) return null;
+  if (cached) return Promise.resolve(cached);
+  if (isNegativeCached(cacheKey)) return Promise.resolve(null);
+  let p = inFlight.get(cacheKey);
+  if (!p) {
+    p = loadMeta(`${baseUrl}/${type}/${metaId}.json`, scheme, metaId, cacheKey)
+      .finally(() => inFlight.delete(cacheKey));
+    inFlight.set(cacheKey, p);
+  }
+  return p;
+}
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), CINEMETA_TIMEOUT_MS);
+async function loadMeta(
+  url: string,
+  scheme: string,
+  metaId: string,
+  cacheKey: string,
+): Promise<TitleInfo | null> {
   try {
-    const url = `${baseUrl}/${type}/${metaId}.json`;
     const res = await fetch(url, {
-      signal: controller.signal,
+      signal: AbortSignal.timeout(META_TIMEOUT_MS),
       headers: { "Accept": "application/json" },
     });
     if (!res.ok) {
@@ -168,172 +174,23 @@ async function fetchMeta(
       return null;
     }
     const data = await res.json();
-    const meta: CinemetaMeta | undefined = data?.meta;
-    if (!meta?.name) {
+    const info = data?.meta ? toTitleInfo(data.meta as RawMeta, scheme) : null;
+    if (!info) {
       logger.warn(`Empty meta for ${metaId}`);
       markFailure(cacheKey);
       return null;
     }
-    cacheSet(cacheKey, meta);
-    return meta;
+    cacheSet(cacheKey, info);
+    return info;
   } catch (err) {
-    if (err instanceof Error && err.name === "AbortError") {
+    if (err instanceof DOMException && err.name === "TimeoutError") {
       logger.warn(`Meta timeout for ${metaId}`);
     } else {
       logger.error(`Meta error for ${metaId}:`, err);
     }
     markFailure(cacheKey);
     return null;
-  } finally {
-    clearTimeout(timeoutId);
   }
-}
-
-
-interface ParsedSeriesId {
-  scheme: string;
-  metaId: string;
-  season: number;
-  episode: number;
-}
-
-// Splits a Stremio series stream id into scheme + meta id + season/episode.
-// Handles both colon-free schemes (tt: "tt123:1:5") and colon-prefixed ones
-// (kitsu: "kitsu:46043:5", where the id itself contains a colon). Anime ids use
-// absolute episode numbering with no season segment, so season defaults to 1.
-function parseSeriesId(rawId: string): ParsedSeriesId | null {
-  const parts = rawId.split(":");
-  let scheme: string;
-  let metaId: string;
-  let rest: string[];
-  if (/^tt\d+$/.test(parts[0])) {
-    scheme = "tt";
-    metaId = parts[0];
-    rest = parts.slice(1);
-  } else if (parts.length >= 2) {
-    scheme = parts[0];
-    metaId = `${parts[0]}:${parts[1]}`;
-    rest = parts.slice(2);
-  } else {
-    return null;
-  }
-  if (rest.length >= 2) {
-    const season = Number(rest[0]);
-    const episode = Number(rest[1]);
-    if (!Number.isFinite(season) || !Number.isFinite(episode)) return null;
-    return { scheme, metaId, season, episode };
-  }
-  if (rest.length === 1) {
-    const episode = Number(rest[0]);
-    if (!Number.isFinite(episode)) return null;
-    return { scheme, metaId, season: 1, episode };
-  }
-  return null;
-}
-
-function parseMovieId(
-  rawId: string,
-): { scheme: string; metaId: string } | null {
-  const parts = rawId.split(":");
-  if (/^tt\d+$/.test(parts[0])) return { scheme: "tt", metaId: parts[0] };
-  if (parts.length >= 2) {
-    return { scheme: parts[0], metaId: `${parts[0]}:${parts[1]}` };
-  }
-  return null;
-}
-
-// Picks the best title for the Google query. Cinemeta (tt) names are already
-// English. Anime metas carry the native/romaji name plus an aliases list; the
-// first latin-script alias is usually the official English title, which gives
-// far better discussion-search results than romaji.
-function pickTitle(meta: CinemetaMeta, scheme: string): string {
-  if (scheme === "tt") return meta.name;
-  const alias = meta.aliases?.find(
-    (a) => /[a-z]/i.test(a) && a !== meta.name,
-  );
-  return alias ?? meta.name;
-}
-
-// Detects anime so tt-id anime (Cinemeta serves most anime under IMDB ids, not
-// kitsu) gets routed to r/anime instead of being treated as a western series.
-// kitsu/mal/anilist/anidb ids are anime by definition; for tt ids we use the
-// reliable Cinemeta signal: Japanese-country animation.
-const ANIME_SCHEMES = new Set(["kitsu", "mal", "anilist", "anidb"]);
-
-function isAnime(meta: CinemetaMeta | null, scheme: string): boolean {
-  if (ANIME_SCHEMES.has(scheme)) return true;
-  if (scheme !== "tt" || !meta) return false;
-  return (meta.genres?.includes("Animation") ?? false) &&
-    meta.country === "Japan";
-}
-
-function googleUrl(query: string): string {
-  return `https://www.google.com/search?q=${encodeURIComponent(query)}`;
-}
-
-// The goal of every query is to surface the single highest-engagement Reddit
-// discussion thread. Google (not Reddit's own search) ranks these well, so we
-// scope the query to the subreddit where that thread lives.
-
-// Anime episodes: r/anime hosts the largest per-episode discussion threads,
-// titled "<Title> - Episode <N> discussion". Season prefix only when > 1, since
-// most r/anime entries number a single cour from episode 1.
-function buildAnimeEpisodeQuery(
-  title: string,
-  season: number,
-  episode: number,
-): string {
-  const seasonPart = season > 1 ? `season ${season} ` : "";
-  return `${title} ${seasonPart}episode ${episode} discussion site:reddit.com/r/anime`;
-}
-
-// Western series episodes live in the show's own subreddit, whose name we can't
-// derive — so we let Google find it across all of Reddit. Number formats vary by
-// sub (1x04 / S01E04 / "Season 1 Episode 4"), so we use natural-language
-// numbering (Google normalizes it) and lean on the episode title, which is the
-// unique token those threads are titled with, e.g.
-//   Severance - 1x04 "The You You Are" - Episode Discussion
-function buildSeriesEpisodeQuery(
-  title: string,
-  season: number,
-  episode: number,
-  episodeTitle?: string,
-): string {
-  const ep = episodeTitle ? ` ${episodeTitle}` : "";
-  return `${title} season ${season} episode ${episode}${ep} discussion site:reddit.com`;
-}
-
-// Pulls an episode's title from the meta's videos list (Cinemeta provides it for
-// western series). Used only to sharpen the Reddit query, so a miss is harmless.
-function findEpisodeTitle(
-  meta: CinemetaMeta,
-  season: number,
-  episode: number,
-): string | undefined {
-  const v = meta.videos?.find(
-    (v) => v.season === season && (v.episode === episode || v.number === episode),
-  );
-  return v?.title ?? v?.name;
-}
-
-// Anime films: discussion lives in r/anime alongside everything else anime.
-function buildAnimeMovieQuery(title: string, year: string | undefined): string {
-  const yearSuffix = year ? ` (${year})` : "";
-  return `${title}${yearSuffix} movie discussion site:reddit.com/r/anime`;
-}
-
-// Non-anime movies link straight to the film's Letterboxd page. For catalog
-// films (the typical Stremio case) Letterboxd holds far more persistent
-// engagement than a long-archived Reddit megathread, and it is keyless,
-// first-party, and deep-linkable by either imdb or tmdb id — so no title lookup
-// is needed and tmdb resolves for free.
-function letterboxdFilmUrl(scheme: string, metaId: string): string | null {
-  if (scheme === "tt") return `https://letterboxd.com/imdb/${metaId}/`;
-  if (scheme === "tmdb") {
-    const id = metaId.split(":")[1];
-    if (id) return `https://letterboxd.com/tmdb/${id}/`;
-  }
-  return null;
 }
 
 // ===== Metrics =====
@@ -358,29 +215,26 @@ function today(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-async function recordRequest(
-  type: "series" | "movie",
-  imdbId: string,
-): Promise<void> {
+async function recordRequest(type: ContentType, metaId: string): Promise<void> {
   memCounters.total++;
   memCounters[type]++;
   const d = today();
   memCounters.byDay.set(d, (memCounters.byDay.get(d) ?? 0) + 1);
   if (
     memCounters.topIds.size >= TOP_IDS_MEM_MAX &&
-    !memCounters.topIds.has(imdbId)
+    !memCounters.topIds.has(metaId)
   ) {
     const oldest = memCounters.topIds.keys().next().value;
     if (oldest !== undefined) memCounters.topIds.delete(oldest);
   }
-  memCounters.topIds.set(imdbId, (memCounters.topIds.get(imdbId) ?? 0) + 1);
+  memCounters.topIds.set(metaId, (memCounters.topIds.get(metaId) ?? 0) + 1);
   if (!kv) return;
   try {
     await kv.atomic()
       .sum(["c", "total"], 1n)
       .sum(["c", "type", type], 1n)
       .sum(["c", "day", d], 1n)
-      .sum(["c", "id", imdbId], 1n)
+      .sum(["c", "id", metaId], 1n)
       .commit();
   } catch (err) {
     logger.warn("KV write failed", err);
@@ -399,7 +253,20 @@ interface Stats {
   top_ids: { id: string; count: number }[];
 }
 
+// /stats is public and the per-id scan grows with the catalog, so reads are
+// cached briefly rather than hitting KV on every page view.
+let statsCache: { stats: Stats; ts: number } | null = null;
+
 async function readStats(): Promise<Stats> {
+  if (statsCache && Date.now() - statsCache.ts < STATS_CACHE_MS) {
+    return statsCache.stats;
+  }
+  const stats = await computeStats();
+  statsCache = { stats, ts: Date.now() };
+  return stats;
+}
+
+async function computeStats(): Promise<Stats> {
   const base: Stats = {
     version: VERSION,
     started_at: STARTED_AT,
@@ -423,18 +290,18 @@ async function readStats(): Promise<Stats> {
       base.total = Number(total.value?.value ?? 0n);
       base.series = Number(series.value?.value ?? 0n);
       base.movie = Number(movie.value?.value ?? 0n);
-      const days: { date: string; count: number }[] = [];
+      // Day keys are ISO dates, so reverse key order is newest first.
       for await (
-        const entry of kv.list<Deno.KvU64>({ prefix: ["c", "day"] })
+        const entry of kv.list<Deno.KvU64>({ prefix: ["c", "day"] }, {
+          reverse: true,
+          limit: 30,
+        })
       ) {
-        days.push({
+        base.by_day.push({
           date: String(entry.key[2]),
           count: Number(entry.value.value),
         });
       }
-      base.by_day = days
-        .sort((a, b) => b.date.localeCompare(a.date))
-        .slice(0, 30);
       const ids: { id: string; count: number }[] = [];
       for await (
         const entry of kv.list<Deno.KvU64>({ prefix: ["c", "id"] })
@@ -469,104 +336,27 @@ async function readStats(): Promise<Stats> {
 
 // ===== Stream handler =====
 
-interface Stream {
-  name?: string;
-  title: string;
-  externalUrl: string;
-  behaviorHints?: Record<string, unknown>;
+interface StreamResult {
+  streams: Stream[];
+  degraded: boolean;
 }
 
-async function handleStream(
-  type: string,
-  id: string,
-): Promise<{ streams: Stream[] }> {
-  if (type === "series") {
-    const parsed = parseSeriesId(id);
-    if (!parsed) {
-      logger.warn("Invalid series id", { id });
-      return { streams: [] };
-    }
-    const { scheme, metaId, season, episode } = parsed;
-    const meta = await fetchMeta(scheme, "series", metaId);
-    recordRequest("series", metaId).catch(() => {});
-    let title: string;
-    if (meta) {
-      title = pickTitle(meta, scheme);
-    } else {
-      title = metaId;
-      logger.info(`Series fallback for ${metaId} S${season}E${episode} (no meta)`);
-    }
-    let query: string;
-    if (isAnime(meta, scheme)) {
-      query = buildAnimeEpisodeQuery(title, season, episode);
-    } else {
-      const episodeTitle = meta
-        ? findEpisodeTitle(meta, season, episode)
-        : undefined;
-      query = buildSeriesEpisodeQuery(title, season, episode, episodeTitle);
-    }
-    return {
-      streams: [{
-        name: "Discussio",
-        title: "Search Episode Discussions",
-        externalUrl: googleUrl(query),
-        behaviorHints: { notWebReady: false },
-      }],
-    };
+async function handleStream(type: ContentType, id: string): Promise<StreamResult> {
+  const parsed = parseId(type, id);
+  if (!parsed) {
+    logger.warn("Invalid id", { type, id });
+    return { streams: [], degraded: false };
   }
-
-  if (type === "movie") {
-    const parsed = parseMovieId(id);
-    if (!parsed) {
-      logger.warn("Invalid movie id", { id });
-      return { streams: [] };
-    }
-    const { scheme, metaId } = parsed;
-    // tt is fetched only to detect anime (Cinemeta serves anime films too);
-    // tmdb has no meta source and resolves to null → non-anime → Letterboxd.
-    const meta = await fetchMeta(scheme, "movie", metaId);
-    recordRequest("movie", metaId).catch(() => {});
-
-    if (isAnime(meta, scheme)) {
-      const title = meta ? pickTitle(meta, scheme) : metaId;
-      const year = meta?.year?.match(/\d{4}/)?.[0] ??
-        meta?.releaseInfo?.match(/\d{4}/)?.[0];
-      return {
-        streams: [{
-          name: "Discussio",
-          title: "Search Movie Discussions",
-          externalUrl: googleUrl(buildAnimeMovieQuery(title, year)),
-          behaviorHints: { notWebReady: false },
-        }],
-      };
-    }
-
-    // Non-anime movie → teleport straight to the Letterboxd film page.
-    const letterboxd = letterboxdFilmUrl(scheme, metaId);
-    if (letterboxd) {
-      return {
-        streams: [{
-          name: "Discussio",
-          title: "Movie Discussion · Letterboxd",
-          externalUrl: letterboxd,
-          behaviorHints: { notWebReady: false },
-        }],
-      };
-    }
-
-    // Unknown scheme with no Letterboxd id — last-resort id search.
-    logger.info(`Movie fallback for ${metaId} (no Letterboxd id)`);
-    return {
-      streams: [{
-        name: "Discussio",
-        title: "Search Movie Discussions",
-        externalUrl: googleUrl(`${metaId} movie discussion`),
-        behaviorHints: { notWebReady: false },
-      }],
-    };
-  }
-
-  return { streams: [] };
+  const info = await fetchMeta(parsed.scheme, type, parsed.metaId);
+  // tmdb never has metadata, and that's expected rather than degraded.
+  const degraded = !info && parsed.scheme in META_SOURCES;
+  if (degraded) logger.info(`No metadata for ${id}, serving fallback`);
+  const streams = type === "series"
+    ? seriesStreams(parsed, info)
+    : movieStreams(parsed, info);
+  // Only count ids we serve, so unroutable schemes don't pile up in KV.
+  if (streams.length) recordRequest(type, parsed.metaId).catch(() => {});
+  return { streams, degraded };
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
@@ -593,33 +383,105 @@ function escapeHtml(s: string): string {
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
 }
 
-function renderLanding(): string {
+// Links a stats id to its page on the id's home site.
+function idUrl(id: string): string | null {
+  const [scheme, num] = id.split(":");
+  if (/^tt\d+$/.test(id)) return `https://www.imdb.com/title/${id}/`;
+  const sites: Record<string, string> = {
+    kitsu: "https://kitsu.app/anime/",
+    mal: "https://myanimelist.net/anime/",
+    anilist: "https://anilist.co/anime/",
+    anidb: "https://anidb.net/anime/",
+    tmdb: "https://www.themoviedb.org/movie/",
+  };
+  return sites[scheme] && num ? `${sites[scheme]}${num}` : null;
+}
+
+// The public manifest URL for this deployment, from the request so self-hosted
+// instances advertise themselves. Proxies (ElfHosted) terminate TLS upstream.
+function manifestUrl(req: Request): URL {
+  const url = new URL("/manifest.json", req.url);
+  const proto = req.headers.get("x-forwarded-proto")?.split(",")[0].trim();
+  if (proto === "https" || proto === "http") url.protocol = `${proto}:`;
+  const host = req.headers.get("x-forwarded-host")?.split(",")[0].trim();
+  if (host) url.host = host;
+  return url;
+}
+
+function renderLanding(req: Request): string {
+  const manifest = manifestUrl(req);
+  const httpsUrl = manifest.href;
+  const stremioUrl = `stremio://${manifest.host}${manifest.pathname}`;
+  const webUrl = `https://web.stremio.com/#/addons?addon=${encodeURIComponent(httpsUrl)}`;
   return `<!doctype html>
 <html lang="en"><head>
-<meta charset="utf-8"><title>Discussio</title>
+<meta charset="utf-8">
+<title>Discussio · Stremio Addon</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="One click from any episode or movie in Stremio to where people are discussing it.">
+<link rel="icon" href="${escapeHtml(LOGO_URL)}">
 <style>
-  body{font-family:system-ui,-apple-system,sans-serif;background:#0f1220;color:#e8eaf6;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:24px;box-sizing:border-box}
-  .card{max-width:560px;background:#1a1f3a;padding:32px;border-radius:16px;box-shadow:0 20px 60px rgba(0,0,0,.4)}
-  h1{margin:0 0 8px;font-size:28px;color:#fff}
-  .tag{color:#9aa3d4;font-size:14px;margin-bottom:24px}
-  p{line-height:1.6;color:#c0c6e8}
-  a{color:#7c8cff;text-decoration:none;font-weight:600}
-  a:hover{text-decoration:underline}
-  .row{display:flex;gap:12px;margin-top:20px;flex-wrap:wrap}
-  .btn{background:#294fff;color:#fff;padding:10px 18px;border-radius:8px;display:inline-block}
-  .ghost{background:transparent;border:1px solid #2c3358;color:#c0c6e8}
-  code{background:#0f1220;padding:2px 6px;border-radius:4px;font-size:13px}
+  :root{--bg:#0b0e1a;--card:#151a30;--line:#262d50;--text:#eceefb;--muted:#9aa3d4;--accent:#294fff;--accent2:#7c8cff}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--text);min-height:100vh;
+    background:radial-gradient(1200px 600px at 50% -10%,rgba(41,79,255,.28),transparent 60%),var(--bg);
+    display:flex;align-items:center;justify-content:center;padding:32px 16px}
+  main{width:100%;max-width:620px;text-align:center}
+  .logo{width:112px;height:112px;border-radius:28px;box-shadow:0 18px 50px rgba(41,79,255,.45)}
+  h1{margin:20px 0 4px;font-size:40px;letter-spacing:-.5px}
+  .ver{color:var(--muted);font-size:13px}
+  .lede{font-size:18px;line-height:1.55;color:#c8cdf0;margin:18px auto 28px;max-width:520px}
+  .install{display:inline-flex;align-items:center;gap:10px;background:var(--accent);color:#fff;font-weight:700;font-size:18px;
+    padding:16px 34px;border-radius:14px;text-decoration:none;box-shadow:0 10px 30px rgba(41,79,255,.45);transition:transform .12s,box-shadow .12s}
+  .install:hover{transform:translateY(-1px);box-shadow:0 14px 36px rgba(41,79,255,.6)}
+  .alt{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:14px}
+  .ghost{background:transparent;border:1px solid var(--line);color:var(--text);padding:10px 16px;border-radius:10px;
+    font:inherit;font-size:14px;cursor:pointer;text-decoration:none}
+  .ghost:hover{border-color:var(--accent2)}
+  .url{margin:18px auto 0;max-width:520px;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px;
+    font:13px ui-monospace,Consolas,monospace;color:var(--muted);overflow-wrap:anywhere}
+  .how{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:40px 0 0;text-align:left}
+  @media (max-width:600px){.how{grid-template-columns:1fr}h1{font-size:34px}}
+  .tile{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
+  .tile b{display:block;font-size:15px;margin-bottom:6px}
+  .tile span{color:var(--muted);font-size:14px;line-height:1.5}
+  .steps{color:var(--muted);font-size:14px;line-height:1.6;margin:28px auto 0;max-width:520px}
+  .note{display:inline-block;margin:16px auto 0;max-width:520px;padding:10px 14px;border-radius:10px;font-size:13px;line-height:1.5;
+    color:var(--muted);background:rgba(124,140,255,.08);border:1px solid var(--line)}
+  footer{margin-top:36px;color:#6e75a3;font-size:13px}
+  footer a{color:var(--accent2);text-decoration:none}
+  footer a:hover{text-decoration:underline}
 </style></head><body>
-<div class="card">
+<main>
+  <img class="logo" src="${escapeHtml(LOGO_URL)}" alt="">
   <h1>Discussio</h1>
-  <div class="tag">Stremio addon · v${VERSION} · Hosted by ElfHosted</div>
-  <p>Opens Google search for TV episode and movie discussions with one click. Install via Stremio: <code>${MANIFEST_URL}</code></p>
-  <div class="row">
-    <a class="btn" href="/manifest.json">Manifest</a>
-    <a class="btn ghost" href="/stats">Stats</a>
+  <div class="ver">Stremio addon · v${VERSION} · Hosted by ElfHosted</div>
+  <p class="lede">Finished an episode? One click takes you to the thread where everyone is talking about it.</p>
+  <a class="install" href="${escapeHtml(stremioUrl)}">Install in Stremio</a>
+  <div class="alt">
+    <a class="ghost" href="${escapeHtml(webUrl)}" target="_blank" rel="noopener">Install on Stremio Web</a>
+    <button class="ghost" id="copy" type="button">Copy manifest URL</button>
   </div>
-</div>
+  <div class="url" id="url">${escapeHtml(httpsUrl)}</div>
+  <section class="how">
+    <div class="tile"><b>📺 Anime</b><span>The r/anime discussion thread for that exact episode.</span></div>
+    <div class="tile"><b>🎞️ TV shows</b><span>The episode discussion in the show's own subreddit.</span></div>
+    <div class="tile"><b>🎬 Movies</b><span>Letterboxd reviews, plus the r/movies official discussion.</span></div>
+  </section>
+  <p class="steps">After installing, open any episode or movie and look in the <b>streams</b> list for <b>Discussio</b>.</p>
+  <p class="note">Installed before v1.3? Install once more to add MyAnimeList, AniList, AniDB and TMDB titles. Future updates apply automatically.</p>
+  <footer>
+    <a href="/stats">Stats</a> · <a href="${REPO_URL}" target="_blank" rel="noopener">GitHub</a> · <a href="https://elfhosted.com" target="_blank" rel="noopener">ElfHosted</a>
+  </footer>
+</main>
+<script>
+  document.getElementById("copy").addEventListener("click", async (e) => {
+    const text = document.getElementById("url").textContent;
+    try { await navigator.clipboard.writeText(text); e.target.textContent = "Copied!"; }
+    catch { e.target.textContent = "Select the URL below to copy"; }
+    setTimeout(() => { e.target.textContent = "Copy manifest URL"; }, 2000);
+  });
+</script>
 </body></html>`;
 }
 
@@ -630,13 +492,14 @@ function renderStatsHtml(stats: Stats): string {
     )
     .join("");
   const idRows = stats.top_ids
-    .map((r) =>
-      `<tr><td><a href="https://www.imdb.com/title/${
-        escapeHtml(r.id)
-      }/" target="_blank" rel="noopener">${
-        escapeHtml(r.id)
-      }</a></td><td class="num">${r.count}</td></tr>`
-    )
+    .map((r) => {
+      const href = idUrl(r.id);
+      const label = escapeHtml(r.id);
+      const cell = href
+        ? `<a href="${escapeHtml(href)}" target="_blank" rel="noopener">${label}</a>`
+        : label;
+      return `<tr><td>${cell}</td><td class="num">${r.count}</td></tr>`;
+    })
     .join("");
   return `<!doctype html>
 <html lang="en"><head>
@@ -678,10 +541,10 @@ function renderStatsHtml(stats: Stats): string {
     </div>
     <div class="panel">
       <h2>Top titles</h2>
-      <table><thead><tr><th>IMDB ID</th><th class="num">Requests</th></tr></thead><tbody>${idRows || '<tr><td colspan="2" style="color:#6e75a3">No data yet</td></tr>'}</tbody></table>
+      <table><thead><tr><th>Title ID</th><th class="num">Requests</th></tr></thead><tbody>${idRows || '<tr><td colspan="2" style="color:#6e75a3">No data yet</td></tr>'}</tbody></table>
     </div>
   </div>
-  <footer>JSON: <a href="/stats.json">/stats.json</a></footer>
+  <footer><a href="/">Home</a> · JSON: <a href="/stats.json">/stats.json</a></footer>
 </div>
 </body></html>`;
 }
@@ -697,9 +560,7 @@ const CORS_HEADERS: Record<string, string> = {
 function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
   const headers = new Headers(init.headers);
   headers.set("Content-Type", "application/json; charset=utf-8");
-  if (!headers.has("Cache-Control")) {
-    headers.set("Cache-Control", "max-age=86400, public");
-  }
+  if (!headers.has("Cache-Control")) headers.set("Cache-Control", CACHE_OK);
   for (const [k, v] of Object.entries(CORS_HEADERS)) headers.set(k, v);
   return new Response(JSON.stringify(body), { ...init, headers });
 }
@@ -709,6 +570,13 @@ function htmlResponse(body: string, init: ResponseInit = {}): Response {
   headers.set("Content-Type", "text/html; charset=utf-8");
   for (const [k, v] of Object.entries(CORS_HEADERS)) headers.set(k, v);
   return new Response(body, { ...init, headers });
+}
+
+function textResponse(body: string, status = 200): Response {
+  return new Response(body, {
+    status,
+    headers: { "Content-Type": "text/plain", ...CORS_HEADERS },
+  });
 }
 
 const PORT = Number(Deno.env.get("PORT") ?? 7000);
@@ -728,7 +596,11 @@ Deno.serve({
     return new Response(null, { status: 204, headers: CORS_HEADERS });
   }
 
-  if (path === "/") return htmlResponse(renderLanding());
+  if (path === "/" || path === "/configure") {
+    return htmlResponse(renderLanding(req), {
+      headers: { "Cache-Control": "max-age=3600" },
+    });
+  }
   if (path === "/manifest.json") {
     // Never cache the manifest: Stremio keys an addon's capabilities (types,
     // idPrefixes) off it, so a stale cached copy silently drops content the
@@ -737,22 +609,25 @@ Deno.serve({
       headers: { "Cache-Control": "no-cache, no-store, must-revalidate" },
     });
   }
-  if (path === "/healthz") {
-    return new Response("ok", {
-      headers: { "Content-Type": "text/plain", ...CORS_HEADERS },
-    });
-  }
+  if (path === "/healthz") return textResponse("ok");
 
   const streamMatch = path.match(/^\/stream\/(series|movie)\/([^/]+?)\.json$/);
   if (streamMatch) {
     const [, type, rawId] = streamMatch;
-    const id = decodeURIComponent(rawId);
+    let id: string;
+    try {
+      id = decodeURIComponent(rawId);
+    } catch {
+      return textResponse("Bad Request", 400);
+    }
     const result = await withTimeout(
-      handleStream(type, id),
+      handleStream(type as ContentType, id),
       HANDLER_TIMEOUT_MS,
-      { streams: [] },
+      { streams: [], degraded: true },
     );
-    return jsonResponse(result);
+    return jsonResponse({ streams: result.streams }, {
+      headers: { "Cache-Control": result.degraded ? CACHE_DEGRADED : CACHE_OK },
+    });
   }
 
   if (path === "/stats.json") {
@@ -766,8 +641,5 @@ Deno.serve({
     return htmlResponse(renderStatsHtml(stats));
   }
 
-  return new Response("Not Found", {
-    status: 404,
-    headers: { "Content-Type": "text/plain", ...CORS_HEADERS },
-  });
+  return textResponse("Not Found", 404);
 });
