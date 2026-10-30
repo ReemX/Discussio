@@ -3,7 +3,7 @@
 A Stremio addon that takes you to the discussion for whatever you're watching in one click. Pick an episode or a movie, and Discussio sends you straight to where people are actually talking about it — the right venue for the kind of content, not a generic web search.
 
 ![Stremio Badge](https://img.shields.io/badge/Stremio-Addon-red.svg)
-![Version](https://img.shields.io/badge/version-1.3.0-blue.svg)
+![Version](https://img.shields.io/badge/version-1.4.0-blue.svg)
 
 ## 🚀 Features
 
@@ -16,7 +16,7 @@ A Stremio addon that takes you to the discussion for whatever you're watching in
 - **Every anime id** — Kitsu, MyAnimeList, AniList and AniDB ids, plus anime served under IMDB ids (auto-detected)
 - **TMDB movies** deep-link straight to Letterboxd
 - Install page with one-click install (`stremio://`), Stremio Web install and copy-URL
-- Public anonymous stats page (`/stats`) — no PII, just request counts
+- Public anonymous stats page (`/stats`) — views, clicks, click-through per destination, top titles; no PII
 - No configuration needed
 
 ## 📦 Installation
@@ -90,22 +90,41 @@ Anonymous usage counters are exposed at:
 - `https://discussio.elfhosted.com/stats` — human-readable page
 - `https://discussio.elfhosted.com/stats.json` — machine-readable JSON
 
-Tracked: total request count, type breakdown (series vs movie), per-day counts
-(last 30 days), and top requested title ids (top 25). No IPs, no user agents,
-no identifiers. Stats are cached for 60 seconds.
+Tracked: **views** (a Discussio stream list was shown), **clicks** (a
+discussion link was opened), click-through, clicks per destination, per-day
+counts (last 30 days) and the top 25 titles. No IPs, no user agents, no
+identifiers. Stats are cached for 60 seconds.
+
+Clicks are counted because stream links point at `/go/...`, which redirects to
+the destination. The target is rebuilt server-side (never read from the URL, so
+it can't be used as an open redirect), which also means routing improvements
+reach stream lists Stremio has already cached.
+
+### Persistence
+
+Stats are kept in memory and persisted one of two ways:
+
+| Backend | When | How |
+|---|---|---|
+| **Upstash Redis** | `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN` are set | Counts are flushed once a minute as a single `EVAL` (~45K commands / ~0.5 GB a month, well inside the free tier). Upstash is the only source of truth. |
+| **GitHub snapshot** | default, needs no secrets | The [Stats snapshot](.github/workflows/stats-snapshot.yml) Action reads `/stats/raw.json` every 15 minutes and merges it into `stats.json` on the `stats-data` branch using only the built-in `GITHUB_TOKEN`. The server reads that public file back for all-time totals. At most ~15 minutes of counts are lost per restart. |
+
+The `stats-data` branch is force-pushed as a single commit, so it never grows,
+and it's separate from `main`, so snapshots never trigger a deploy. Set
+`STATS_SNAPSHOT_URL` to read the snapshot from elsewhere (e.g. a fork).
 
 ## 🛠️ Technical Details
 
 - Built with Deno and TypeScript, native `Deno.serve` (no SDK runtime dependency)
 - `src/discussio.ts` — pure routing logic (id parsing, title picking, queries, streams), unit-tested in `src/discussio_test.ts`
-- `src/addon.ts` — HTTP server, metadata cache, stats, HTML pages
+- `src/addon.ts` — HTTP server, metadata cache, HTML pages
+- `src/stats.ts` — counters and the Upstash / GitHub-snapshot persistence; `src/snapshot.ts` holds the snapshot merge logic (unit-tested), run by `scripts/snapshot.ts`
 - **Metadata sources**, all keyless:
   - `tt` → **Cinemeta** (`https://v3-cinemeta.strem.io`)
   - `kitsu` / `mal` / `anilist` / `anidb` → **Kitsu** addon (`https://anime-kitsu.strem.fun`)
   - `tmdb` movies → **Letterboxd** id deep-link (no meta fetch needed)
 - Compact LRU + TTL cache (5000 titles × 24h; only the fields routing needs are kept) + short negative cache + in-flight request de-duplication
 - Responses are cached 24h; fallback responses (metadata unavailable) only 5 minutes
-- Persistent counters via Deno KV (`--unstable-kv`), falls back to in-memory
 - The manifest claims no `idPrefixes`, so Stremio offers every series/movie id and unroutable ids get an empty answer. Stremio never refreshes an installed manifest, so this lets new id schemes reach existing installs without a reinstall
 - The manifest is served `no-cache` so a fresh install always gets the current copy
 - Default port: `7000` (override with `PORT`), log level via `LOG_LEVEL` (`0`=debug … `3`=error)
@@ -120,7 +139,15 @@ no identifiers. Stats are cached for 60 seconds.
 | `/stream/movie/:id.json` | Stream handler for movies / anime films |
 | `/stats` | Public stats page |
 | `/stats.json` | Public stats JSON |
+| `/stats/raw.json` | This instance's raw counts (read by the snapshot Action) |
+| `/go/:type/:id/:venue` | Counts a click and redirects to the destination |
 | `/healthz` | Health check |
+
+## 🔧 What Changed in 1.4.0
+
+- **Added**: click tracking via `/go` redirects; the stats page shows views, clicks, click-through and clicks per destination.
+- **Added**: top titles show names instead of raw ids.
+- **Changed**: stats persist without secrets via a GitHub Action snapshot, or via Upstash Redis when its env vars are set. Deno KV is no longer used (production never had a persistent volume, so stats reset on every deploy).
 
 ## 🔧 What Changed in 1.3.0
 

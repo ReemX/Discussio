@@ -57,7 +57,11 @@ export interface ParsedId {
   episode?: number;
 }
 
+// Where a link leads; used to attribute clicks.
+export type Venue = "anime" | "reddit" | "movies" | "letterboxd" | "search";
+
 export interface Stream {
+  venue: Venue;
   name: string;
   title: string; // deprecated by Stremio in favor of description; kept for old clients
   description: string;
@@ -217,8 +221,8 @@ export function seriesEpisodeQuery(
   return `${title} season ${season} episode ${episode}${ep} discussion site:reddit.com`;
 }
 
-function stream(description: string, externalUrl: string): Stream {
-  return { name: "Discussio", title: description, description, externalUrl };
+function stream(venue: Venue, description: string, externalUrl: string): Stream {
+  return { venue, name: "Discussio", title: description, description, externalUrl };
 }
 
 export function seriesStreams(parsed: ParsedId, info: TitleInfo | null): Stream[] {
@@ -230,6 +234,7 @@ export function seriesStreams(parsed: ParsedId, info: TitleInfo | null): Stream[
     if (!(parsed.scheme in META_SOURCES)) return [];
     const label = `S${season}E${episode}`;
     return [stream(
+      "search",
       `💬 Search episode discussions\n${label}`,
       googleUrl(`${parsed.metaId} season ${season} episode ${episode} discussion`),
     )];
@@ -247,12 +252,14 @@ export function seriesStreams(parsed: ParsedId, info: TitleInfo | null): Stream[
     // split needs the absolute alternative.
     const absolute = parsed.scheme === "tt" ? ep.absolute : undefined;
     return [stream(
+      "anime",
       `💬 r/anime · Episode discussion\n${title} · ${label}`,
       googleUrl(animeEpisodeQuery(title, season, episode, absolute, ep.title)),
     )];
   }
   const epTitle = ep.title ? ` · ${ep.title}` : "";
   return [stream(
+    "reddit",
     `💬 Reddit · Episode discussion\n${title} · S${season}E${episode}${epTitle}`,
     googleUrl(seriesEpisodeQuery(title, season, episode, ep.title)),
   )];
@@ -267,15 +274,17 @@ export function movieStreams(parsed: ParsedId, info: TitleInfo | null): Stream[]
   const lb = letterboxdUrl(imdbId, tmdbId);
   const out: Stream[] = [];
   const heading = info ? `\n${info.title}${info.year ? ` (${info.year})` : ""}` : "";
-  if (lb) out.push(stream(`🎬 Letterboxd · Reviews & discussion${heading}`, lb));
+  if (lb) out.push(stream("letterboxd", `🎬 Letterboxd · Reviews & discussion${heading}`, lb));
   if (info) {
     const year = info.year ? ` (${info.year})` : "";
     const reddit = info.anime
       ? stream(
+        "anime",
         `💬 r/anime · Movie discussion${heading}`,
         googleUrl(`${info.title}${year} movie discussion site:reddit.com/r/anime`),
       )
       : stream(
+        "movies",
         `💬 r/movies · Official discussion${heading}`,
         googleUrl(`${info.title}${year} official discussion site:reddit.com/r/movies`),
       );
@@ -285,6 +294,7 @@ export function movieStreams(parsed: ParsedId, info: TitleInfo | null): Stream[]
   }
   if (!out.length && parsed.scheme in META_SOURCES) {
     out.push(stream(
+      "search",
       "💬 Search movie discussions",
       googleUrl(`${parsed.metaId} movie discussion`),
     ));

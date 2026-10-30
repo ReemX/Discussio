@@ -1,0 +1,50 @@
+# Persists stats without giving the host any secret: reads the live instance's
+# public raw counts and merges them into stats.json on the stats-data branch,
+# which the server reads back for all-time totals. Uses only the built-in
+# GITHUB_TOKEN. The branch is force-pushed as a single commit so history never
+# grows, and it is separate from main so snapshots never trigger a deploy.
+
+name: Stats snapshot
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: stats-snapshot
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: Load current snapshot
+        run: |
+          if git fetch --depth 1 origin stats-data 2>/dev/null; then
+            git show FETCH_HEAD:stats.json > "$RUNNER_TEMP/stats.json"
+          fi
+      - name: Merge live counts
+        run: >
+          deno run --allow-net --allow-read --allow-write
+          scripts/snapshot.ts "$RUNNER_TEMP/stats.json" https://discussio.elfhosted.com/stats/raw.json
+      - name: Publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          [ -f "$RUNNER_TEMP/stats.json" ] || exit 0
+          mkdir "$RUNNER_TEMP/out" && cd "$RUNNER_TEMP/out"
+          cp ../stats.json .
+          git init -q -b stats-data
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add stats.json
+          git commit -qm "Stats snapshot"
+          git push -qf "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" stats-data

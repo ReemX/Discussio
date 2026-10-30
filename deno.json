@@ -1,9 +1,9 @@
 {
   "tasks": {
-    "dev": "deno run --watch --unstable-kv --allow-net --allow-env src/addon.ts",
-    "start": "deno run --unstable-kv --allow-net --allow-env src/addon.ts",
+    "dev": "deno run --watch --allow-net --allow-env src/addon.ts",
+    "start": "deno run --allow-net --allow-env src/addon.ts",
     "test": "deno test src/",
-    "check": "deno check src/ && deno lint && deno test src/"
+    "check": "deno check src/ scripts/ && deno lint && deno test src/"
   },
   "imports": {
     "@std/assert": "jsr:@std/assert@1"

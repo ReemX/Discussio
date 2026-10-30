@@ -2,6 +2,7 @@
 // Routing lives in discussio.ts; this file is the HTTP server, metadata cache
 // and anonymous stats.
 
+import { rawStats, readStats, recordClick, recordView, startStats, type Stats } from "./stats.ts";
 import {
   type ContentType,
   META_SOURCES,
@@ -14,7 +15,7 @@ import {
   toTitleInfo,
 } from "./discussio.ts";
 
-const VERSION = "1.3.0";
+const VERSION = "1.4.0";
 const REPO_URL = "https://github.com/ReemX/Discussio";
 const LOGO_URL =
   "https://api.logo.com/api/v2/images?design=lg_aiGdQc9PParm0yrELH&width=250&height=250&fit=contain&margin_ratio=0&background=%23294fff&u=2025-02-19T10%3A24%3A54.398Z&format=png&quality=30";
@@ -22,10 +23,8 @@ const TITLE_CACHE_MAX = 5000;
 const TITLE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const NEGATIVE_CACHE_TTL_MS = 5 * 60 * 1000;
 const NEGATIVE_CACHE_MAX = 1000;
-const TOP_IDS_MEM_MAX = 2000;
 const META_TIMEOUT_MS = 5000;
 const HANDLER_TIMEOUT_MS = 6500;
-const STATS_CACHE_MS = 60 * 1000;
 // Full answers are stable for a day; degraded ones (metadata unavailable)
 // are retried soon instead of pinning a poor link in Stremio's cache.
 const CACHE_OK = "max-age=86400, stale-while-revalidate=86400, stale-if-error=604800";
@@ -195,144 +194,7 @@ async function loadMeta(
 
 // ===== Metrics =====
 
-let kv: Deno.Kv | null = null;
-try {
-  kv = await Deno.openKv();
-  logger.info("Deno KV opened");
-} catch (err) {
-  logger.warn("Deno KV unavailable, metrics in-memory only", err);
-}
-
-const memCounters = {
-  total: 0,
-  series: 0,
-  movie: 0,
-  byDay: new Map<string, number>(),
-  topIds: new Map<string, number>(),
-};
-
-function today(): string {
-  return new Date().toISOString().slice(0, 10);
-}
-
-async function recordRequest(type: ContentType, metaId: string): Promise<void> {
-  memCounters.total++;
-  memCounters[type]++;
-  const d = today();
-  memCounters.byDay.set(d, (memCounters.byDay.get(d) ?? 0) + 1);
-  if (
-    memCounters.topIds.size >= TOP_IDS_MEM_MAX &&
-    !memCounters.topIds.has(metaId)
-  ) {
-    const oldest = memCounters.topIds.keys().next().value;
-    if (oldest !== undefined) memCounters.topIds.delete(oldest);
-  }
-  memCounters.topIds.set(metaId, (memCounters.topIds.get(metaId) ?? 0) + 1);
-  if (!kv) return;
-  try {
-    await kv.atomic()
-      .sum(["c", "total"], 1n)
-      .sum(["c", "type", type], 1n)
-      .sum(["c", "day", d], 1n)
-      .sum(["c", "id", metaId], 1n)
-      .commit();
-  } catch (err) {
-    logger.warn("KV write failed", err);
-  }
-}
-
-interface Stats {
-  version: string;
-  started_at: string;
-  total: number;
-  series: number;
-  movie: number;
-  cache_size: number;
-  backend: "kv" | "memory";
-  by_day: { date: string; count: number }[];
-  top_ids: { id: string; count: number }[];
-}
-
-// /stats is public and the per-id scan grows with the catalog, so reads are
-// cached briefly rather than hitting KV on every page view.
-let statsCache: { stats: Stats; ts: number } | null = null;
-
-async function readStats(): Promise<Stats> {
-  if (statsCache && Date.now() - statsCache.ts < STATS_CACHE_MS) {
-    return statsCache.stats;
-  }
-  const stats = await computeStats();
-  statsCache = { stats, ts: Date.now() };
-  return stats;
-}
-
-async function computeStats(): Promise<Stats> {
-  const base: Stats = {
-    version: VERSION,
-    started_at: STARTED_AT,
-    total: 0,
-    series: 0,
-    movie: 0,
-    cache_size: metaCache.size,
-    backend: kv ? "kv" : "memory",
-    by_day: [],
-    top_ids: [],
-  };
-  if (kv) {
-    try {
-      const [total, series, movie] = await kv.getMany<
-        [Deno.KvU64, Deno.KvU64, Deno.KvU64]
-      >([
-        ["c", "total"],
-        ["c", "type", "series"],
-        ["c", "type", "movie"],
-      ]);
-      base.total = Number(total.value?.value ?? 0n);
-      base.series = Number(series.value?.value ?? 0n);
-      base.movie = Number(movie.value?.value ?? 0n);
-      // Day keys are ISO dates, so reverse key order is newest first.
-      for await (
-        const entry of kv.list<Deno.KvU64>({ prefix: ["c", "day"] }, {
-          reverse: true,
-          limit: 30,
-        })
-      ) {
-        base.by_day.push({
-          date: String(entry.key[2]),
-          count: Number(entry.value.value),
-        });
-      }
-      const ids: { id: string; count: number }[] = [];
-      for await (
-        const entry of kv.list<Deno.KvU64>({ prefix: ["c", "id"] })
-      ) {
-        ids.push({
-          id: String(entry.key[2]),
-          count: Number(entry.value.value),
-        });
-      }
-      base.top_ids = ids
-        .sort((a, b) => b.count - a.count)
-        .slice(0, 25);
-      return base;
-    } catch (err) {
-      logger.warn("KV read failed, using memory", err);
-      base.backend = "memory";
-    }
-  }
-  base.total = memCounters.total;
-  base.series = memCounters.series;
-  base.movie = memCounters.movie;
-  base.by_day = [...memCounters.byDay.entries()]
-    .map(([date, count]) => ({ date, count }))
-    .sort((a, b) => b.date.localeCompare(a.date))
-    .slice(0, 30);
-  base.top_ids = [...memCounters.topIds.entries()]
-    .map(([id, count]) => ({ id, count }))
-    .sort((a, b) => b.count - a.count)
-    .slice(0, 25);
-  return base;
-}
+startStats(logger);
 
 // ===== Stream handler =====
 
@@ -341,22 +203,40 @@ interface StreamResult {
   degraded: boolean;
 }
 
-async function handleStream(type: ContentType, id: string): Promise<StreamResult> {
+async function resolveStreams(
+  type: ContentType,
+  id: string,
+): Promise<StreamResult & { name?: string }> {
   const parsed = parseId(type, id);
-  if (!parsed) {
-    logger.warn("Invalid id", { type, id });
-    return { streams: [], degraded: false };
-  }
+  if (!parsed) return { streams: [], degraded: false };
   const info = await fetchMeta(parsed.scheme, type, parsed.metaId);
   // tmdb never has metadata, and that's expected rather than degraded.
   const degraded = !info && parsed.scheme in META_SOURCES;
-  if (degraded) logger.info(`No metadata for ${id}, serving fallback`);
   const streams = type === "series"
     ? seriesStreams(parsed, info)
     : movieStreams(parsed, info);
-  // Only count ids we serve, so unroutable schemes don't pile up in KV.
-  if (streams.length) recordRequest(type, parsed.metaId).catch(() => {});
-  return { streams, degraded };
+  return { streams, degraded, name: info?.title };
+}
+
+// Stream links point at /go so clicks can be counted and so a link's target
+// is computed at click time — Stremio caches stream lists for a day, but
+// routing improvements still reach every cached list immediately.
+async function handleStream(
+  type: ContentType,
+  id: string,
+  origin: string,
+): Promise<StreamResult> {
+  const { streams, degraded, name } = await resolveStreams(type, id);
+  if (degraded) logger.info(`No metadata for ${id}, serving fallback`);
+  // Only count ids we serve, so unroutable schemes don't pile up in stats.
+  if (streams.length) recordView(type, parseId(type, id)!.metaId, name);
+  return {
+    degraded,
+    streams: streams.map(({ venue, ...s }) => ({
+      ...s,
+      externalUrl: `${origin}/go/${type}/${encodeURIComponent(id)}/${venue}`,
+    })) as Stream[],
+  };
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
@@ -397,10 +277,10 @@ function idUrl(id: string): string | null {
   return sites[scheme] && num ? `${sites[scheme]}${num}` : null;
 }
 
-// The public manifest URL for this deployment, from the request so self-hosted
-// instances advertise themselves. Proxies (ElfHosted) terminate TLS upstream.
-function manifestUrl(req: Request): URL {
-  const url = new URL("/manifest.json", req.url);
+// This deployment's public origin, from the request so self-hosted instances
+// advertise themselves. Proxies (ElfHosted) terminate TLS upstream.
+function publicOrigin(req: Request): URL {
+  const url = new URL("/", req.url);
   const proto = req.headers.get("x-forwarded-proto")?.split(",")[0].trim();
   if (proto === "https" || proto === "http") url.protocol = `${proto}:`;
   const host = req.headers.get("x-forwarded-host")?.split(",")[0].trim();
@@ -409,7 +289,7 @@ function manifestUrl(req: Request): URL {
 }
 
 function renderLanding(req: Request): string {
-  const manifest = manifestUrl(req);
+  const manifest = new URL("/manifest.json", publicOrigin(req));
   const httpsUrl = manifest.href;
   const stremioUrl = `stremio://${manifest.host}${manifest.pathname}`;
   const webUrl = `https://web.stremio.com/#/addons?addon=${encodeURIComponent(httpsUrl)}`;
@@ -485,67 +365,234 @@ function renderLanding(req: Request): string {
 </body></html>`;
 }
 
+const VENUE_LABELS: Record<string, string> = {
+  anime: "r/anime",
+  reddit: "Reddit · show subreddits",
+  movies: "r/movies",
+  letterboxd: "Letterboxd",
+  search: "Fallback search",
+};
+
+const fmt = (v: number) => v.toLocaleString("en-US");
+
+// Compact axis/tile numbers: 12.3K, 4.5M.
+function compact(v: number): string {
+  if (v >= 1e6) return `${(v / 1e6).toFixed(v >= 1e7 ? 0 : 1)}M`;
+  if (v >= 1e4) return `${(v / 1e3).toFixed(v >= 1e5 ? 0 : 1)}K`;
+  return fmt(v);
+}
+
+// The last 30 UTC days, oldest first, zero-filled so gaps read as gaps.
+function dailySeries(stats: Stats): { date: string; views: number; clicks: number }[] {
+  const byDate = new Map(stats.by_day.map((d) => [d.date, d]));
+  const out = [];
+  const now = Date.now();
+  for (let i = 29; i >= 0; i--) {
+    const date = new Date(now - i * 86400000).toISOString().slice(0, 10);
+    out.push(byDate.get(date) ?? { date, views: 0, clicks: 0 });
+  }
+  return out;
+}
+
+function dayLabel(date: string): string {
+  return new Date(`${date}T00:00:00Z`).toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+    timeZone: "UTC",
+  });
+}
+
+function barChart(
+  days: { date: string; views: number; clicks: number }[],
+  key: "views" | "clicks",
+  label: string,
+): string {
+  const max = Math.max(...days.map((d) => d[key]));
+  const bars = days.map((d) => {
+    const v = d[key];
+    const h = max ? Math.max(v ? 3 : 0, (v / max) * 100) : 0;
+    const tip = `${fmt(v)} ${key}`;
+    return `<div class="col" tabindex="0" data-v="${escapeHtml(tip)}" data-l="${
+      escapeHtml(dayLabel(d.date))
+    }" aria-label="${escapeHtml(`${dayLabel(d.date)}: ${tip}`)}"><span style="height:${
+      h.toFixed(1)
+    }%"></span></div>`;
+  }).join("");
+  return `<figure class="chart">
+    <figcaption><span>${label}</span><span class="max">${max ? `peak ${compact(max)}` : ""}</span></figcaption>
+    <div class="plot">${bars}</div>
+  </figure>`;
+}
+
 function renderStatsHtml(stats: Stats): string {
-  const dayRows = stats.by_day
-    .map((d) =>
-      `<tr><td>${escapeHtml(d.date)}</td><td class="num">${d.count}</td></tr>`
-    )
-    .join("");
-  const idRows = stats.top_ids
-    .map((r) => {
-      const href = idUrl(r.id);
-      const label = escapeHtml(r.id);
-      const cell = href
-        ? `<a href="${escapeHtml(href)}" target="_blank" rel="noopener">${label}</a>`
-        : label;
-      return `<tr><td>${cell}</td><td class="num">${r.count}</td></tr>`;
-    })
-    .join("");
+  const days = dailySeries(stats);
+  const hasDays = stats.by_day.length > 0;
+  const venueMax = Math.max(1, ...stats.by_venue.map((v) => v.clicks));
+  const venueRows = stats.by_venue.map((v) => {
+    const share = stats.clicks ? Math.round((v.clicks / stats.clicks) * 100) : 0;
+    return `<li><div class="vl"><span>${escapeHtml(VENUE_LABELS[v.venue] ?? v.venue)}</span><b>${
+      fmt(v.clicks)
+    }</b><em>${share}%</em></div><div class="track"><span style="width:${
+      ((v.clicks / venueMax) * 100).toFixed(1)
+    }%"></span></div></li>`;
+  }).join("");
+  const titleMax = Math.max(1, ...stats.top_titles.map((t) => t.views));
+  const titleRow = (t: Stats["top_titles"][number], i: number) => {
+    const href = idUrl(t.id);
+    const label = escapeHtml(t.name ?? t.id);
+    const name = href
+      ? `<a href="${escapeHtml(href)}" target="_blank" rel="noopener">${label}</a>`
+      : label;
+    return `<li><span class="rank">${i + 1}</span><div class="tt"><div class="tn">${name}<b>${
+      fmt(t.views)
+    }</b></div><div class="track thin"><span style="width:${
+      ((t.views / titleMax) * 100).toFixed(1)
+    }%"></span></div></div></li>`;
+  };
+  const top = stats.top_titles.slice(0, 10).map(titleRow).join("");
+  const more = stats.top_titles.slice(10).map((t, i) => titleRow(t, i + 10)).join("");
+  const scope = stats.backend === "memory" ? "Since this instance started" : "All-time";
+  const split = stats.by_type.series + stats.by_type.movie;
+  const seriesPct = split ? Math.round((stats.by_type.series / split) * 100) : 50;
+  const empty = (msg: string) => `<p class="empty">${msg}</p>`;
   return `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><title>Discussio · Stats</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" href="${escapeHtml(LOGO_URL)}">
 <style>
-  body{font-family:system-ui,-apple-system,sans-serif;background:#0f1220;color:#e8eaf6;margin:0;padding:24px;box-sizing:border-box}
-  .wrap{max-width:960px;margin:0 auto}
-  h1{margin:0 0 8px;font-size:28px}
-  .tag{color:#9aa3d4;font-size:13px;margin-bottom:24px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:28px}
-  .stat{background:#1a1f3a;padding:18px;border-radius:12px}
-  .label{color:#9aa3d4;font-size:12px;text-transform:uppercase;letter-spacing:.5px}
-  .value{font-size:28px;font-weight:700;color:#fff;margin-top:4px}
-  .panels{display:grid;grid-template-columns:1fr 1fr;gap:20px}
-  @media (max-width:720px){.panels{grid-template-columns:1fr}}
-  .panel{background:#1a1f3a;padding:20px;border-radius:12px}
-  h2{margin:0 0 14px;font-size:16px;color:#fff}
-  table{width:100%;border-collapse:collapse;font-size:14px}
-  th,td{padding:8px 4px;text-align:left;border-bottom:1px solid #2c3358}
-  th{color:#9aa3d4;font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.5px}
-  .num{text-align:right;font-variant-numeric:tabular-nums}
-  a{color:#7c8cff;text-decoration:none}
-  a:hover{text-decoration:underline}
-  footer{margin-top:24px;color:#6e75a3;font-size:12px}
+  :root{--bg:#0b0e1a;--card:#131830;--card2:#171d38;--line:#242b4d;--grid:#1d2342;--text:#eceefb;--muted:#9aa3d4;--faint:#6e75a3;
+    --accent:#294fff;--mark:#5b7bff;--mark-hi:#8098ff}
+  *{box-sizing:border-box}
+  html{background:var(--bg)}
+  body{margin:0;min-height:100vh;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--text);
+    background:radial-gradient(900px 400px at 15% -10%,rgba(41,79,255,.18),transparent 60%) no-repeat,var(--bg)}
+  .wrap{max-width:1120px;margin:0 auto;padding:24px 16px 28px}
+  header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:18px}
+  header img{width:40px;height:40px;border-radius:11px;box-shadow:0 6px 20px rgba(41,79,255,.4)}
+  h1{margin:0;font-size:22px;letter-spacing:-.2px}
+  .pills{display:flex;gap:6px;flex-wrap:wrap;margin-left:auto}
+  .pill{font-size:12px;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:4px 10px;background:var(--card)}
+  .pill.live::before{content:"";display:inline-block;width:6px;height:6px;border-radius:50%;background:#3ddc97;margin-right:6px;vertical-align:1px}
+  .kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:12px}
+  .kpi{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 16px}
+  .kpi .l{color:var(--muted);font-size:12px;font-weight:500}
+  .kpi .v{font-size:30px;font-weight:700;letter-spacing:-.5px;margin-top:2px;font-variant-numeric:tabular-nums}
+  .kpi .h{color:var(--faint);font-size:12px;margin-top:2px}
+  .split{display:flex;height:6px;border-radius:3px;overflow:hidden;gap:2px;margin-top:10px}
+  .split i{background:var(--mark);border-radius:3px}
+  .split i+i{background:var(--line)}
+  .main{display:grid;grid-template-columns:1.6fr 1fr;gap:12px;margin-bottom:12px}
+  .panel{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px 18px;min-width:0}
+  h2{margin:0 0 12px;font-size:14px;font-weight:600;display:flex;justify-content:space-between;align-items:baseline}
+  h2 small{color:var(--faint);font-weight:400;font-size:12px}
+  .chart{margin:0 0 14px}
+  .chart:last-of-type{margin-bottom:6px}
+  figcaption{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-bottom:6px}
+  figcaption .max{color:var(--faint)}
+  .plot{height:92px;display:flex;align-items:flex-end;gap:2px;border-bottom:1px solid var(--line);
+    background:repeating-linear-gradient(to top,transparent 0 22px,var(--grid) 22px 23px)}
+  .col{flex:1;height:100%;display:flex;align-items:flex-end;cursor:default;outline:none}
+  .col span{display:block;width:100%;background:var(--mark);border-radius:4px 4px 0 0;transition:background .1s}
+  .col:hover span,.col:focus-visible span{background:var(--mark-hi)}
+  .col:focus-visible{box-shadow:inset 0 0 0 1px var(--mark-hi);border-radius:4px}
+  .axis{display:flex;justify-content:space-between;font-size:11px;color:var(--faint);margin-top:6px}
+  #tip{position:fixed;pointer-events:none;background:#0b0e1a;border:1px solid var(--line);border-radius:8px;padding:6px 9px;
+    font-size:12px;color:var(--muted);box-shadow:0 8px 24px rgba(0,0,0,.4);opacity:0;transition:opacity .08s;z-index:10}
+  #tip b{display:block;color:var(--text);font-size:13px}
+  ul,ol{list-style:none;margin:0;padding:0}
+  .venues li+li{margin-top:12px}
+  .vl{display:flex;align-items:baseline;gap:8px;font-size:13px;margin-bottom:5px}
+  .vl span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .vl b{font-variant-numeric:tabular-nums}
+  .vl em{font-style:normal;color:var(--faint);font-size:12px;width:34px;text-align:right}
+  .track{height:8px;border-radius:4px;background:var(--grid);overflow:hidden}
+  .track span{display:block;height:100%;background:var(--mark);border-radius:4px}
+  .track.thin{height:4px;margin-top:5px}
+  .titles{display:grid;grid-template-columns:1fr 1fr;column-gap:28px;row-gap:10px}
+  .titles li{display:flex;gap:10px;align-items:flex-start;min-width:0}
+  .rank{width:20px;flex:none;color:var(--faint);font-size:12px;text-align:right;padding-top:2px;font-variant-numeric:tabular-nums}
+  .tt{flex:1;min-width:0}
+  .tn{display:flex;gap:8px;font-size:13px}
+  .tn a,.tn>span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .tn b{font-variant-numeric:tabular-nums;font-weight:600}
+  details{margin-top:12px}
+  summary{cursor:pointer;color:var(--muted);font-size:13px;list-style:none}
+  summary::-webkit-details-marker{display:none}
+  summary::before{content:"▸ ";color:var(--faint)}
+  details[open] summary::before{content:"▾ "}
+  details .titles{margin-top:12px}
+  .empty{color:var(--faint);font-size:13px;margin:8px 0 0}
+  a{color:var(--text);text-decoration:none}
+  a:hover{color:var(--mark-hi)}
+  footer{margin-top:14px;color:var(--faint);font-size:12px;display:flex;gap:6px 14px;flex-wrap:wrap}
+  footer a{color:var(--muted)}
+  @media (max-width:860px){.kpis{grid-template-columns:1fr 1fr}.main{grid-template-columns:1fr}}
+  @media (max-width:560px){.titles{grid-template-columns:1fr}.pills{margin-left:0}.kpi .v{font-size:24px}}
 </style></head><body>
 <div class="wrap">
-  <h1>Discussio Stats</h1>
-  <div class="tag">v${stats.version} · started ${escapeHtml(stats.started_at)} · backend: ${stats.backend} · cache: ${stats.cache_size}</div>
-  <div class="grid">
-    <div class="stat"><div class="label">Total requests</div><div class="value">${stats.total.toLocaleString()}</div></div>
-    <div class="stat"><div class="label">Series</div><div class="value">${stats.series.toLocaleString()}</div></div>
-    <div class="stat"><div class="label">Movies</div><div class="value">${stats.movie.toLocaleString()}</div></div>
-  </div>
-  <div class="panels">
+  <header>
+    <img src="${escapeHtml(LOGO_URL)}" alt="">
+    <h1>Discussio Stats</h1>
+    <div class="pills">
+      <span class="pill live">${scope}</span>
+      <span class="pill">v${stats.version}</span>
+      <span class="pill">No personal data</span>
+    </div>
+  </header>
+
+  <section class="kpis">
+    <div class="kpi"><div class="l">Views</div><div class="v">${compact(stats.views)}</div><div class="h">stream lists shown</div></div>
+    <div class="kpi"><div class="l">Clicks</div><div class="v">${compact(stats.clicks)}</div><div class="h">discussions opened</div></div>
+    <div class="kpi"><div class="l">Click-through</div><div class="v">${stats.click_through}%</div><div class="h">clicks per view</div></div>
+    <div class="kpi"><div class="l">Series · Movies</div><div class="v">${seriesPct}% · ${100 - seriesPct}%</div>
+      <div class="split" aria-label="${fmt(stats.by_type.series)} series, ${fmt(stats.by_type.movie)} movie views"><i style="flex:${stats.by_type.series || 1}"></i><i style="flex:${stats.by_type.movie || 1}"></i></div></div>
+  </section>
+
+  <section class="main">
     <div class="panel">
-      <h2>Last 30 days</h2>
-      <table><thead><tr><th>Date</th><th class="num">Requests</th></tr></thead><tbody>${dayRows || '<tr><td colspan="2" style="color:#6e75a3">No data yet</td></tr>'}</tbody></table>
+      <h2>Daily activity <small>last 30 days · UTC</small></h2>
+      ${hasDays ? barChart(days, "views", "Views") + barChart(days, "clicks", "Clicks") +
+        `<div class="axis"><span>${dayLabel(days[0].date)}</span><span>${dayLabel(days[29].date)}</span></div>` : empty("No activity recorded yet.")}
     </div>
     <div class="panel">
-      <h2>Top titles</h2>
-      <table><thead><tr><th>Title ID</th><th class="num">Requests</th></tr></thead><tbody>${idRows || '<tr><td colspan="2" style="color:#6e75a3">No data yet</td></tr>'}</tbody></table>
+      <h2>Clicks by destination <small>${fmt(stats.clicks)} total</small></h2>
+      ${venueRows ? `<ul class="venues">${venueRows}</ul>` : empty("No clicks recorded yet.")}
     </div>
-  </div>
-  <footer><a href="/">Home</a> · JSON: <a href="/stats.json">/stats.json</a></footer>
+  </section>
+
+  <section class="panel">
+    <h2>Top titles <small>by views</small></h2>
+    ${top ? `<ol class="titles">${top}</ol>` : empty("No titles yet.")}
+    ${more ? `<details><summary>Show ${stats.top_titles.length - 10} more</summary><ol class="titles">${more}</ol></details>` : ""}
+  </section>
+
+  <footer>
+    <a href="/">Home</a><a href="/stats.json">JSON</a>
+    <span>Storage: ${stats.backend}</span>
+    <span>Instance started ${escapeHtml(stats.started_at.slice(0, 16).replace("T", " "))} UTC</span>
+    <span>Title cache ${fmt(stats.cache_size)}</span>
+  </footer>
 </div>
+<div id="tip" role="tooltip"><b></b><span></span></div>
+<script>
+  const tip = document.getElementById("tip");
+  const show = (el, x, y) => {
+    tip.firstChild.textContent = el.dataset.v;
+    tip.lastChild.textContent = el.dataset.l;
+    const r = tip.getBoundingClientRect();
+    tip.style.left = Math.min(innerWidth - r.width - 8, Math.max(8, x - r.width / 2)) + "px";
+    tip.style.top = Math.max(8, y - r.height - 12) + "px";
+    tip.style.opacity = 1;
+  };
+  const hide = () => { tip.style.opacity = 0; };
+  for (const el of document.querySelectorAll(".col")) {
+    el.addEventListener("pointermove", (e) => show(el, e.clientX, e.clientY));
+    el.addEventListener("pointerleave", hide);
+    el.addEventListener("focus", () => { const r = el.getBoundingClientRect(); show(el, r.left + r.width / 2, r.top); });
+    el.addEventListener("blur", hide);
+  }
+</script>
 </body></html>`;
 }
 
@@ -621,7 +668,7 @@ Deno.serve({
       return textResponse("Bad Request", 400);
     }
     const result = await withTimeout(
-      handleStream(type as ContentType, id),
+      handleStream(type as ContentType, id, publicOrigin(req).origin),
       HANDLER_TIMEOUT_MS,
       { streams: [], degraded: true },
     );
@@ -630,14 +677,44 @@ Deno.serve({
     });
   }
 
+  const goMatch = path.match(/^\/go\/(series|movie)\/([^/]+)\/([a-z]+)$/);
+  if (goMatch) {
+    const [, type, rawId, venue] = goMatch;
+    let id: string;
+    try {
+      id = decodeURIComponent(rawId);
+    } catch {
+      return textResponse("Bad Request", 400);
+    }
+    // The target is rebuilt server-side, never taken from the URL, so /go
+    // can't be used as an open redirect.
+    const { streams } = await withTimeout(
+      resolveStreams(type as ContentType, id),
+      HANDLER_TIMEOUT_MS,
+      { streams: [], degraded: true },
+    );
+    const target = streams.find((s) => s.venue === venue) ?? streams[0];
+    if (!target) return textResponse("Not Found", 404);
+    recordClick(target.venue);
+    return new Response(null, {
+      status: 302,
+      headers: { Location: target.externalUrl, "Cache-Control": "no-store" },
+    });
+  }
+
+  const statsMeta = { version: VERSION, started_at: STARTED_AT, cache_size: metaCache.size };
   if (path === "/stats.json") {
-    const stats = await readStats();
+    const stats = await readStats(statsMeta);
     return jsonResponse(stats, {
       headers: { "Cache-Control": "no-cache, no-store" },
     });
   }
+  if (path === "/stats/raw.json") {
+    // Read by the snapshot Action (.github/workflows/stats-snapshot.yml).
+    return jsonResponse(rawStats(), { headers: { "Cache-Control": "no-store" } });
+  }
   if (path === "/stats") {
-    const stats = await readStats();
+    const stats = await readStats(statsMeta);
     return htmlResponse(renderStatsHtml(stats));
   }
 
