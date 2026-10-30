@@ -1,23 +1,36 @@
-// Anonymous usage counters. Always counted in memory; when
-// UPSTASH_REDIS_REST_URL/TOKEN are set, they are also flushed to Upstash Redis
-// once a minute as a single EVAL (far inside the free tier). Every replica
-// flushes its own increments, so Upstash holds exact all-time totals across
-// replicas and restarts. Without Upstash, stats cover this instance only.
+// Anonymous usage counters. Always counted in memory; when Redis is
+// configured they are also flushed there once a minute as a single EVAL.
+// Every replica flushes only its own increments, which Redis adds atomically,
+// so Redis holds exact all-time totals across replicas and restarts.
+// Without Redis, stats cover this instance only.
+//
+// Redis, in order of preference:
+//  - REDIS_URL: native Redis, redis://[[user]:password@]host[:port][/db]
+//  - UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN: Upstash over REST
 
 import type { ContentType, Venue } from "./discussio.ts";
+import { parseRedisUrl, redisCommand } from "./redis.ts";
 
 const FLUSH_INTERVAL_MS = 60 * 1000;
 const STATS_CACHE_MS = 60 * 1000;
-const UPSTASH_TIMEOUT_MS = 5000;
+const REDIS_TIMEOUT_MS = 5000;
 const TITLES_MEM_MAX = 5000;
 const TOP_TITLES = 25;
 const DAYS = 30;
 
+const REDIS_URL = Deno.env.get("REDIS_URL");
 const UPSTASH_URL = Deno.env.get("UPSTASH_REDIS_REST_URL");
 const UPSTASH_TOKEN = Deno.env.get("UPSTASH_REDIS_REST_TOKEN");
-const useUpstash = Boolean(UPSTASH_URL && UPSTASH_TOKEN);
 
-export type Backend = "upstash" | "memory";
+export type Backend = "redis" | "upstash" | "memory";
+
+const backend: Backend = REDIS_URL
+  ? "redis"
+  : UPSTASH_URL && UPSTASH_TOKEN
+  ? "upstash"
+  : "memory";
+const persistent = backend !== "memory";
+const redisTarget = REDIS_URL ? parseRedisUrl(REDIS_URL) : null;
 
 // This instance's counts since start. Counter fields: views, views:<type>,
 // views:day:<date>, clicks, clicks:venue:<venue>, clicks:day:<date>.
@@ -25,14 +38,28 @@ const counters = new Map<string, number>();
 const titles = new Map<string, number>();
 const names = new Map<string, string>();
 
-// Counts not yet flushed to Upstash.
+// Counts not yet packed into a batch.
 const pending = {
   counters: new Map<string, number>(),
   titles: new Map<string, number>(),
   names: new Map<string, string>(),
 };
 
+// Batches not yet confirmed by Redis, oldest first. A batch keeps its id
+// across retries: a timed-out EVAL may still have been applied (it was already
+// in Redis's input buffer), and the id lets the script skip a duplicate.
+interface Batch {
+  id: string;
+  c: Record<string, number>;
+  t: Record<string, number>;
+  n: Record<string, string>;
+}
+const unsent: Batch[] = [];
+const UNSENT_MAX = 1440; // a day of minutely batches
+let flushing = false;
+
 const FLUSH_SCRIPT = `
+if not redis.call('SET', 'discussio:batch:' .. ARGV[2], 1, 'NX', 'EX', 86400) then return 0 end
 local p = cjson.decode(ARGV[1])
 for f, n in pairs(p.c) do redis.call('HINCRBY', 'discussio:counters', f, n) end
 for id, n in pairs(p.t) do redis.call('ZINCRBY', 'discussio:titles', n, id) end
@@ -62,7 +89,7 @@ function today(): string {
 
 function count(field: string): void {
   bump(counters, field);
-  if (useUpstash) bump(pending.counters, field);
+  if (persistent) bump(pending.counters, field);
 }
 
 function countTitle(id: string, name?: string): void {
@@ -74,10 +101,10 @@ function countTitle(id: string, name?: string): void {
     }
   }
   bump(titles, id);
-  if (useUpstash) bump(pending.titles, id);
+  if (persistent) bump(pending.titles, id);
   if (name && names.get(id) !== name) {
     names.set(id, name);
-    if (useUpstash) pending.names.set(id, name);
+    if (persistent) pending.names.set(id, name);
   }
 }
 
@@ -94,12 +121,13 @@ export function recordClick(venue: Venue): void {
   count(`clicks:day:${today()}`);
 }
 
-async function upstash(command: (string | number)[]): Promise<unknown> {
+async function redis(command: (string | number)[]): Promise<unknown> {
+  if (redisTarget) return await redisCommand(redisTarget, command, REDIS_TIMEOUT_MS);
   const res = await fetch(UPSTASH_URL!, {
     method: "POST",
     headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
     body: JSON.stringify(command),
-    signal: AbortSignal.timeout(UPSTASH_TIMEOUT_MS),
+    signal: AbortSignal.timeout(REDIS_TIMEOUT_MS),
   });
   const body = await res.json();
   if (!res.ok || body.error) throw new Error(body.error ?? `HTTP ${res.status}`);
@@ -107,34 +135,40 @@ async function upstash(command: (string | number)[]): Promise<unknown> {
 }
 
 export async function flush(): Promise<void> {
-  if (!useUpstash || (!pending.counters.size && !pending.titles.size)) return;
-  const batch = {
-    c: Object.fromEntries(pending.counters),
-    t: Object.fromEntries(pending.titles),
-    n: Object.fromEntries(pending.names),
-  };
-  pending.counters.clear();
-  pending.titles.clear();
-  pending.names.clear();
+  if (!persistent || flushing) return;
+  flushing = true;
   try {
-    await upstash(["EVAL", FLUSH_SCRIPT, 0, JSON.stringify(batch)]);
-  } catch (err) {
-    log.warn("Stats flush failed, will retry", err);
-    // Requeue so nothing is lost; titles only while bounded.
-    for (const [k, n] of Object.entries(batch.c)) bump(pending.counters, k, n);
-    for (const [k, n] of Object.entries(batch.t)) {
-      if (pending.titles.size < TITLES_MEM_MAX || pending.titles.has(k)) {
-        bump(pending.titles, k, n);
+    if (pending.counters.size || pending.titles.size) {
+      unsent.push({
+        id: crypto.randomUUID(),
+        c: Object.fromEntries(pending.counters),
+        t: Object.fromEntries(pending.titles),
+        n: Object.fromEntries(pending.names),
+      });
+      pending.counters.clear();
+      pending.titles.clear();
+      pending.names.clear();
+      if (unsent.length > UNSENT_MAX) {
+        unsent.shift();
+        log.warn("Stats backlog full, dropped the oldest batch");
       }
     }
-    for (const [k, v] of Object.entries(batch.n)) pending.names.set(k, v);
+    while (unsent.length) {
+      const { id, ...batch } = unsent[0];
+      await redis(["EVAL", FLUSH_SCRIPT, 0, JSON.stringify(batch), id]);
+      unsent.shift();
+    }
+  } catch (err) {
+    log.warn(`Stats flush failed, will retry (${unsent.length} batch(es) queued)`, err);
+  } finally {
+    flushing = false;
   }
 }
 
 export function startStats(logger: Logger): void {
   log = logger;
-  log.info(`Stats backend: ${useUpstash ? "upstash" : "memory"}`);
-  if (!useUpstash) return;
+  log.info(`Stats backend: ${backend}`);
+  if (!persistent) return;
   setInterval(() => flush(), FLUSH_INTERVAL_MS);
   for (const sig of ["SIGTERM", "SIGINT"] as const) {
     try {
@@ -203,22 +237,23 @@ function summarize(
   };
 }
 
-async function upstashSummary(meta: StatsMeta): Promise<Stats> {
-  const raw = JSON.parse(await upstash(["EVAL", READ_SCRIPT, 0]) as string) as {
+async function redisSummary(meta: StatsMeta): Promise<Stats> {
+  const raw = JSON.parse(await redis(["EVAL", READ_SCRIPT, 0]) as string) as {
     c: string[];
     t: string[];
     n: (string | false)[];
   };
   const c = new Map<string, number>();
   for (let i = 0; i < raw.c.length; i += 2) c.set(raw.c[i], Number(raw.c[i + 1]));
-  // Upstash holds the flushed totals; add what's still waiting to flush.
+  // Redis holds the flushed totals; add what's still waiting to flush.
   for (const [k, n] of pending.counters) bump(c, k, n);
+  for (const b of unsent) for (const [k, n] of Object.entries(b.c)) bump(c, k, n);
   const top: TopTitle[] = [];
   for (let i = 0; i < raw.t.length; i += 2) {
     const id = raw.t[i];
     top.push({ id, name: raw.n[i / 2] || names.get(id), views: Number(raw.t[i + 1]) });
   }
-  return summarize(c, top, meta, "upstash");
+  return summarize(c, top, meta, backend);
 }
 
 function memorySummary(meta: StatsMeta): Stats {
@@ -234,9 +269,9 @@ let statsCache: { stats: Stats; ts: number } | null = null;
 export async function readStats(meta: StatsMeta): Promise<Stats> {
   if (statsCache && Date.now() - statsCache.ts < STATS_CACHE_MS) return statsCache.stats;
   let stats: Stats | null = null;
-  if (useUpstash) {
+  if (persistent) {
     try {
-      stats = await upstashSummary(meta);
+      stats = await redisSummary(meta);
     } catch (err) {
       log.warn("Stats read failed, showing this instance only", err);
     }

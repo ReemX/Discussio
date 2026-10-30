@@ -102,19 +102,28 @@ reach stream lists Stremio has already cached.
 
 ### Persistence
 
-Stats are always counted in memory. When `UPSTASH_REDIS_REST_URL` and
-`UPSTASH_REDIS_REST_TOKEN` are set, every replica also flushes its counts to
-Upstash Redis once a minute as a single `EVAL` (~45K commands / ~0.5 GB a month
-per replica, well inside the free tier), and the stats page reads all-time
-totals across all replicas from there. Without Upstash, the page shows only the
-instance that served it, since it was last started.
+Stats are always counted in memory and, when Redis is configured, flushed to it
+once a minute as a single `EVAL`:
+
+| Variable | Backend |
+|---|---|
+| `REDIS_URL` | Native Redis / Valkey: `redis://[[user]:password@]host[:port][/db]` (`rediss://` for TLS). Preferred. |
+| `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` | Upstash over REST (~45K commands / ~0.5 GB a month per replica, inside the free tier) |
+
+Every replica flushes only its own increments, which Redis adds atomically, so
+totals are exact across replicas and restarts. Each batch carries an id that the
+script records atomically, so a retry after a timeout (when Redis may already
+have applied the batch) is never counted twice; unconfirmed batches are kept and
+retried in order. If Redis is unreachable, the addon keeps serving and the stats
+page shows the serving instance's own counts. Without Redis, stats cover only
+the instance that served the page, since it was last started.
 
 ## 🛠️ Technical Details
 
 - Built with Deno and TypeScript, native `Deno.serve` (no SDK runtime dependency)
 - `src/discussio.ts` — pure routing logic (id parsing, title picking, queries, streams), unit-tested in `src/discussio_test.ts`
 - `src/addon.ts` — HTTP server, metadata cache, HTML pages
-- `src/stats.ts` — counters, with optional Upstash Redis persistence
+- `src/stats.ts` — counters, with optional Redis persistence; `src/redis.ts` is a minimal dependency-free native Redis client
 - **Metadata sources**, all keyless:
   - `tt` → **Cinemeta** (`https://v3-cinemeta.strem.io`)
   - `kitsu` / `mal` / `anilist` / `anidb` → **Kitsu** addon (`https://anime-kitsu.strem.fun`)
@@ -142,7 +151,7 @@ instance that served it, since it was last started.
 
 - **Added**: click tracking via `/go` redirects; the stats page shows views, clicks, click-through and clicks per destination.
 - **Added**: top titles show names instead of raw ids.
-- **Changed**: stats persist to Upstash Redis when its env vars are set, summing all replicas; otherwise they are per-instance and in memory. Deno KV is no longer used (production never had a persistent volume, so stats reset on every deploy).
+- **Changed**: stats persist to Redis (`REDIS_URL`, or Upstash via its REST env vars), summing all replicas exactly; otherwise they are per-instance and in memory. Deno KV is no longer used (production never had a persistent volume, so stats reset on every deploy).
 
 ## 🔧 What Changed in 1.3.0
 
