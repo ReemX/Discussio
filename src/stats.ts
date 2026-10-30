@@ -1,33 +1,23 @@
-// Anonymous usage counters, persisted one of two ways:
-//  - Upstash Redis, when UPSTASH_REDIS_REST_URL/TOKEN are set: counts are
-//    flushed once a minute as a single EVAL (far inside the free tier) and
-//    Upstash alone is the source of truth.
-//  - Otherwise, the secret-free GitHub snapshot (see snapshot.ts): all-time
-//    totals are read from the public stats-data branch and this instance's
-//    in-memory counts are added on top.
-// If neither is reachable, the page shows this instance's counts only.
+// Anonymous usage counters. Always counted in memory; when
+// UPSTASH_REDIS_REST_URL/TOKEN are set, they are also flushed to Upstash Redis
+// once a minute as a single EVAL (far inside the free tier). Every replica
+// flushes its own increments, so Upstash holds exact all-time totals across
+// replicas and restarts. Without Upstash, stats cover this instance only.
 
 import type { ContentType, Venue } from "./discussio.ts";
-import { baselineFor, type Counts, type RawStats, type Snapshot } from "./snapshot.ts";
 
 const FLUSH_INTERVAL_MS = 60 * 1000;
-const BASELINE_REFRESH_MS = 15 * 60 * 1000;
 const STATS_CACHE_MS = 60 * 1000;
-const REMOTE_TIMEOUT_MS = 5000;
+const UPSTASH_TIMEOUT_MS = 5000;
 const TITLES_MEM_MAX = 5000;
 const TOP_TITLES = 25;
 const DAYS = 30;
-const SNAPSHOT_URL = Deno.env.get("STATS_SNAPSHOT_URL") ??
-  "https://raw.githubusercontent.com/ReemX/Discussio/stats-data/stats.json";
 
 const UPSTASH_URL = Deno.env.get("UPSTASH_REDIS_REST_URL");
 const UPSTASH_TOKEN = Deno.env.get("UPSTASH_REDIS_REST_TOKEN");
 const useUpstash = Boolean(UPSTASH_URL && UPSTASH_TOKEN);
 
-export type Backend = "upstash" | "github" | "memory";
-
-// Identifies this process, so snapshot merges can tell restarts apart.
-const INSTANCE = `${new Date().toISOString()}-${crypto.randomUUID().slice(0, 8)}`;
+export type Backend = "upstash" | "memory";
 
 // This instance's counts since start. Counter fields: views, views:<type>,
 // views:day:<date>, clicks, clicks:venue:<venue>, clicks:day:<date>.
@@ -35,15 +25,12 @@ const counters = new Map<string, number>();
 const titles = new Map<string, number>();
 const names = new Map<string, string>();
 
-// Upstash mode: counts not yet flushed.
+// Counts not yet flushed to Upstash.
 const pending = {
   counters: new Map<string, number>(),
   titles: new Map<string, number>(),
   names: new Map<string, string>(),
 };
-
-// GitHub mode: all-time totals from before this instance.
-let baseline: Snapshot["totals"] | null = null;
 
 const FLUSH_SCRIPT = `
 local p = cjson.decode(ARGV[1])
@@ -107,30 +94,12 @@ export function recordClick(venue: Venue): void {
   count(`clicks:day:${today()}`);
 }
 
-// What the snapshot Action reads: this instance's raw counts since start.
-export function rawStats(): RawStats {
-  return {
-    instance: INSTANCE,
-    backend: currentBackend(),
-    counters: Object.fromEntries(counters),
-    titles: Object.fromEntries(titles),
-    names: Object.fromEntries(names),
-  };
-}
-
-function currentBackend(): Backend {
-  if (useUpstash) return "upstash";
-  return baseline ? "github" : "memory";
-}
-
-// ----- Upstash -----
-
 async function upstash(command: (string | number)[]): Promise<unknown> {
   const res = await fetch(UPSTASH_URL!, {
     method: "POST",
     headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
     body: JSON.stringify(command),
-    signal: AbortSignal.timeout(REMOTE_TIMEOUT_MS),
+    signal: AbortSignal.timeout(UPSTASH_TIMEOUT_MS),
   });
   const body = await res.json();
   if (!res.ok || body.error) throw new Error(body.error ?? `HTTP ${res.status}`);
@@ -162,65 +131,19 @@ export async function flush(): Promise<void> {
   }
 }
 
-async function readUpstash(): Promise<{ c: Map<string, number>; top: TopTitle[] }> {
-  const raw = JSON.parse(await upstash(["EVAL", READ_SCRIPT, 0]) as string) as {
-    c: string[];
-    t: string[];
-    n: (string | false)[];
-  };
-  const c = new Map<string, number>();
-  for (let i = 0; i < raw.c.length; i += 2) c.set(raw.c[i], Number(raw.c[i + 1]));
-  // Upstash holds the flushed totals; add what's still waiting to flush.
-  for (const [k, n] of pending.counters) bump(c, k, n);
-  const top: TopTitle[] = [];
-  for (let i = 0; i < raw.t.length; i += 2) {
-    const id = raw.t[i];
-    top.push({ id, name: raw.n[i / 2] || names.get(id), views: Number(raw.t[i + 1]) });
-  }
-  return { c, top };
-}
-
-// ----- GitHub snapshot -----
-
-async function loadBaseline(): Promise<void> {
-  try {
-    const res = await fetch(SNAPSHOT_URL, { signal: AbortSignal.timeout(REMOTE_TIMEOUT_MS) });
-    if (res.status === 404) {
-      // No snapshot yet (first run): start the all-time totals from zero.
-      baseline ??= { counters: {}, titles: {}, names: {} };
-      return;
-    }
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const snap = await res.json() as Snapshot;
-    if (!snap?.totals?.counters) throw new Error("malformed snapshot");
-    baseline = baselineFor(snap, INSTANCE);
-  } catch (err) {
-    log.warn("Stats snapshot unavailable, showing this instance only", err);
-  }
-}
-
 export function startStats(logger: Logger): void {
   log = logger;
-  if (useUpstash) {
-    log.info("Stats backend: upstash");
-    setInterval(() => flush(), FLUSH_INTERVAL_MS);
-    for (const sig of ["SIGTERM", "SIGINT"] as const) {
-      try {
-        Deno.addSignalListener(sig, () => flush().finally(() => Deno.exit(0)));
-      } catch {
-        // Signal not supported on this platform (e.g. SIGTERM on Windows).
-      }
+  log.info(`Stats backend: ${useUpstash ? "upstash" : "memory"}`);
+  if (!useUpstash) return;
+  setInterval(() => flush(), FLUSH_INTERVAL_MS);
+  for (const sig of ["SIGTERM", "SIGINT"] as const) {
+    try {
+      Deno.addSignalListener(sig, () => flush().finally(() => Deno.exit(0)));
+    } catch {
+      // Signal not supported on this platform (e.g. SIGTERM on Windows).
     }
-    return;
   }
-  log.info("Stats backend: github snapshot");
-  loadBaseline();
-  // Refreshing is exact: baselineFor() removes what the snapshot already
-  // took from this instance.
-  setInterval(() => loadBaseline(), BASELINE_REFRESH_MS);
 }
-
-// ----- Summary -----
 
 interface TopTitle {
   id: string;
@@ -244,7 +167,12 @@ export interface Stats {
 
 type StatsMeta = Pick<Stats, "version" | "started_at" | "cache_size">;
 
-function summarize(c: Map<string, number>, top: TopTitle[], meta: StatsMeta, backend: Backend): Stats {
+function summarize(
+  c: Map<string, number>,
+  top: TopTitle[],
+  meta: StatsMeta,
+  backend: Backend,
+): Stats {
   const views = c.get("views") ?? 0;
   const clicks = c.get("clicks") ?? 0;
   const days = new Map<string, { views: number; clicks: number }>();
@@ -275,20 +203,30 @@ function summarize(c: Map<string, number>, top: TopTitle[], meta: StatsMeta, bac
   };
 }
 
-function localSummary(meta: StatsMeta): Stats {
-  const c = new Map(counters);
-  const t = new Map(titles);
-  const n = new Map(names);
-  if (baseline) {
-    for (const [k, v] of Object.entries(baseline.counters as Counts)) bump(c, k, v);
-    for (const [k, v] of Object.entries(baseline.titles as Counts)) bump(t, k, v);
-    for (const [k, v] of Object.entries(baseline.names)) if (!n.has(k)) n.set(k, v);
+async function upstashSummary(meta: StatsMeta): Promise<Stats> {
+  const raw = JSON.parse(await upstash(["EVAL", READ_SCRIPT, 0]) as string) as {
+    c: string[];
+    t: string[];
+    n: (string | false)[];
+  };
+  const c = new Map<string, number>();
+  for (let i = 0; i < raw.c.length; i += 2) c.set(raw.c[i], Number(raw.c[i + 1]));
+  // Upstash holds the flushed totals; add what's still waiting to flush.
+  for (const [k, n] of pending.counters) bump(c, k, n);
+  const top: TopTitle[] = [];
+  for (let i = 0; i < raw.t.length; i += 2) {
+    const id = raw.t[i];
+    top.push({ id, name: raw.n[i / 2] || names.get(id), views: Number(raw.t[i + 1]) });
   }
-  const top = [...t.entries()]
+  return summarize(c, top, meta, "upstash");
+}
+
+function memorySummary(meta: StatsMeta): Stats {
+  const top = [...titles.entries()]
     .sort((a, b) => b[1] - a[1])
     .slice(0, TOP_TITLES)
-    .map(([id, views]) => ({ id, name: n.get(id), views }));
-  return summarize(c, top, meta, baseline ? "github" : "memory");
+    .map(([id, views]) => ({ id, name: names.get(id), views }));
+  return summarize(counters, top, meta, "memory");
 }
 
 let statsCache: { stats: Stats; ts: number } | null = null;
@@ -298,13 +236,12 @@ export async function readStats(meta: StatsMeta): Promise<Stats> {
   let stats: Stats | null = null;
   if (useUpstash) {
     try {
-      const { c, top } = await readUpstash();
-      stats = summarize(c, top, meta, "upstash");
+      stats = await upstashSummary(meta);
     } catch (err) {
       log.warn("Stats read failed, showing this instance only", err);
     }
   }
-  stats ??= localSummary(meta);
+  stats ??= memorySummary(meta);
   statsCache = { stats, ts: Date.now() };
   return stats;
 }

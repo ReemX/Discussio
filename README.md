@@ -102,29 +102,19 @@ reach stream lists Stremio has already cached.
 
 ### Persistence
 
-Stats are kept in memory and persisted one of two ways:
-
-| Backend | When | How |
-|---|---|---|
-| **Upstash Redis** | `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN` are set | Counts are flushed once a minute as a single `EVAL` (~45K commands / ~0.5 GB a month, well inside the free tier). Upstash is the only source of truth. |
-| **GitHub snapshot** | default, needs no secrets | The [Stats snapshot](.github/workflows/stats-snapshot.yml) Action reads `/stats/raw.json` every 15 minutes and merges it into `stats.json` on the `stats-data` branch using only the built-in `GITHUB_TOKEN`. The server reads that public file back for all-time totals. At most ~15 minutes of counts are lost per restart. |
-
-The host runs several replicas behind a load balancer, each counting on its
-own. Both backends sum them: Upstash receives every replica's increments, and
-the snapshot Action reads `/stats/raw.json` repeatedly over fresh connections to
-reach every replica, keeping each instance's last reading so it only ever adds
-what's new.
-
-The `stats-data` branch is force-pushed as a single commit, so it never grows,
-and it's separate from `main`, so snapshots never trigger a deploy. Set
-`STATS_SNAPSHOT_URL` to read the snapshot from elsewhere (e.g. a fork).
+Stats are always counted in memory. When `UPSTASH_REDIS_REST_URL` and
+`UPSTASH_REDIS_REST_TOKEN` are set, every replica also flushes its counts to
+Upstash Redis once a minute as a single `EVAL` (~45K commands / ~0.5 GB a month
+per replica, well inside the free tier), and the stats page reads all-time
+totals across all replicas from there. Without Upstash, the page shows only the
+instance that served it, since it was last started.
 
 ## 🛠️ Technical Details
 
 - Built with Deno and TypeScript, native `Deno.serve` (no SDK runtime dependency)
 - `src/discussio.ts` — pure routing logic (id parsing, title picking, queries, streams), unit-tested in `src/discussio_test.ts`
 - `src/addon.ts` — HTTP server, metadata cache, HTML pages
-- `src/stats.ts` — counters and the Upstash / GitHub-snapshot persistence; `src/snapshot.ts` holds the snapshot merge logic (unit-tested), run by `scripts/snapshot.ts`
+- `src/stats.ts` — counters, with optional Upstash Redis persistence
 - **Metadata sources**, all keyless:
   - `tt` → **Cinemeta** (`https://v3-cinemeta.strem.io`)
   - `kitsu` / `mal` / `anilist` / `anidb` → **Kitsu** addon (`https://anime-kitsu.strem.fun`)
@@ -145,7 +135,6 @@ and it's separate from `main`, so snapshots never trigger a deploy. Set
 | `/stream/movie/:id.json` | Stream handler for movies / anime films |
 | `/stats` | Public stats page |
 | `/stats.json` | Public stats JSON |
-| `/stats/raw.json` | This instance's raw counts (read by the snapshot Action) |
 | `/go/:type/:id/:venue` | Counts a click and redirects to the destination |
 | `/healthz` | Health check |
 
@@ -153,7 +142,7 @@ and it's separate from `main`, so snapshots never trigger a deploy. Set
 
 - **Added**: click tracking via `/go` redirects; the stats page shows views, clicks, click-through and clicks per destination.
 - **Added**: top titles show names instead of raw ids.
-- **Changed**: stats persist without secrets via a GitHub Action snapshot, or via Upstash Redis when its env vars are set. Deno KV is no longer used (production never had a persistent volume, so stats reset on every deploy).
+- **Changed**: stats persist to Upstash Redis when its env vars are set, summing all replicas; otherwise they are per-instance and in memory. Deno KV is no longer used (production never had a persistent volume, so stats reset on every deploy).
 
 ## 🔧 What Changed in 1.3.0
 

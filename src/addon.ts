@@ -2,7 +2,7 @@
 // Routing lives in discussio.ts; this file is the HTTP server, metadata cache
 // and anonymous stats.
 
-import { rawStats, readStats, recordClick, recordView, startStats, type Stats } from "./stats.ts";
+import { readStats, recordClick, recordView, startStats, type Stats } from "./stats.ts";
 import {
   type ContentType,
   META_SOURCES,
@@ -708,10 +708,6 @@ Deno.serve({
     return jsonResponse(stats, {
       headers: { "Cache-Control": "no-cache, no-store" },
     });
-  }
-  if (path === "/stats/raw.json") {
-    // Read by the snapshot Action (.github/workflows/stats-snapshot.yml).
-    return jsonResponse(rawStats(), { headers: { "Cache-Control": "no-store" } });
   }
   if (path === "/stats") {
     const stats = await readStats(statsMeta);
